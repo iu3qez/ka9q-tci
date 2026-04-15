@@ -102,11 +102,12 @@ dal preset indicato.
 - Evitare dipendenze crate pesanti: preferire crate piccole e ben
   mantenute (tokio, tokio-tungstenite, socket2, bytes, thiserror, tracing).
 
-## Comandi (da popolare)
+## Comandi
 
-- Build: *TBD* (`cargo build --release` una volta creato `Cargo.toml`).
-- Run: *TBD*.
-- Test: *TBD*.
+- Build: `cargo build` (debug) / `cargo build --release`
+- Run: `cargo run -- --status-name hf.local --bind-addr 0.0.0.0:40001`
+- Test: `cargo test`
+- Lint: `RUSTFLAGS="-D warnings" cargo check` (CI-ready)
 
 ## Riferimenti esterni
 
