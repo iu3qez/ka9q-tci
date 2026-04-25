@@ -14,6 +14,7 @@ use tracing::{info, warn, debug};
 
 use super::protocol::{self, TciCommand, format_msg, handshake_messages};
 use super::state::SharedState;
+use crate::bridge::BridgeCmd;
 
 /// Parametri del server TCI, derivati dalla config.
 pub struct ServerConfig {
@@ -224,7 +225,11 @@ async fn handle_command(
                     "vfo",
                     &[&trx.to_string(), &vfo.to_string(), &freq_hz.to_string()],
                 ));
-                // TODO: inviare COMMAND TLV a radiod per riaccordare l'SSRC
+                send_bridge_cmd(state, BridgeCmd::Tune {
+                    trx: *trx as u8,
+                    vfo: *vfo as u8,
+                    freq_hz: *freq_hz,
+                });
             }
         }
 
@@ -326,6 +331,11 @@ async fn handle_command(
                     "rx_channel_enable",
                     &[&trx.to_string(), &channel.to_string(), if *enable { "true" } else { "false" }],
                 ));
+                send_bridge_cmd(state, BridgeCmd::EnableRx {
+                    trx: *trx as u8,
+                    vfo: *channel as u8,
+                    enable: *enable,
+                });
             }
         }
 
@@ -372,6 +382,7 @@ async fn handle_command(
         TciCommand::IqSamplerate { rate } => {
             *state.iq_samplerate.write().await = *rate;
             replies.push(format_msg("iq_samplerate", &[&rate.to_string()]));
+            send_bridge_cmd(state, BridgeCmd::SetSr { samprate: *rate });
         }
 
         TciCommand::IqStart { trx } => {
@@ -410,4 +421,12 @@ async fn handle_command(
     }
 
     replies
+}
+
+/// Inoltra un BridgeCmd al bridge senza bloccare (try_send).
+/// Se il canale è pieno, logga e droppa: i client TCI possono ritrasmettere.
+fn send_bridge_cmd(state: &SharedState, cmd: BridgeCmd) {
+    if let Err(e) = state.cmd_tx.try_send(cmd) {
+        warn!(err = %e, "bridge cmd channel full or closed, dropping");
+    }
 }

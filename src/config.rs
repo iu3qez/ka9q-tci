@@ -25,4 +25,8 @@ pub struct Args {
     /// Numero massimo di receiver TCI esposti
     #[arg(long, default_value_t = 2)]
     pub max_trx: u8,
+
+    /// Intervallo POLL del control plane verso radiod (secondi)
+    #[arg(long, default_value_t = 5)]
+    pub poll_interval_secs: u64,
 }

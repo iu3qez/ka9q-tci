@@ -4,7 +4,9 @@
 //! modulazione, filtro, e flag di streaming IQ/audio attivo.
 
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
+
+use crate::bridge::BridgeCmd;
 
 /// Stato di un singolo canale VFO (A o B).
 #[derive(Debug, Clone)]
@@ -67,16 +69,25 @@ pub struct SharedState {
     /// Canale broadcast per frame IQ (bridge → client).
     /// I client si iscrivono con `iq_tx.subscribe()`.
     pub iq_tx: broadcast::Sender<IqFrame>,
+
+    /// Canale comandi verso il bridge (server WS → cmd_task).
+    /// Bounded: in caso di Full, il caller logga e droppa (no backpressure).
+    pub cmd_tx: mpsc::Sender<BridgeCmd>,
 }
 
 impl SharedState {
-    pub fn new(trx_count: usize, iq_samplerate: u32) -> Arc<Self> {
+    pub fn new(
+        trx_count: usize,
+        iq_samplerate: u32,
+        cmd_tx: mpsc::Sender<BridgeCmd>,
+    ) -> Arc<Self> {
         let (iq_tx, _) = broadcast::channel(64); // buffer 64 frame
         let trx = (0..trx_count).map(|_| TrxState::default()).collect();
         Arc::new(Self {
             trx: RwLock::new(trx),
             iq_samplerate: RwLock::new(iq_samplerate),
             iq_tx,
+            cmd_tx,
         })
     }
 
