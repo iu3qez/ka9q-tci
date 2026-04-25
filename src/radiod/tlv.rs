@@ -37,32 +37,46 @@ impl TryFrom<u8> for PktType {
 }
 
 // ── TLV type IDs (sottoinsieme usato dal bridge) ───────────────────
-/// Valori da ka9q-radio src/status.h
+/// Valori da ka9q-radio src/status.h (enum status_type, ordinato).
+/// SOURCE OF TRUTH: `../ka9q-radio/src/status.h`. Verifica con:
+///   awk '/enum status_type/,/^};/' src/status.h | grep -E "^\\s*[A-Z]"
+/// I valori sono indici nell'enum C, mai aggiunti/rimossi nel mezzo
+/// (vedi commento in status.h: "I try not to delete or rearrange").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[allow(non_camel_case_types)]
 pub enum StatusType {
     EOL = 0,
     COMMAND_TAG = 1,
-    // 10
     INPUT_SAMPRATE = 10,
-    // 21-23
-    OUTPUT_SSRC = 21,
-    OUTPUT_SAMPRATE = 23,
-    // 40-49
-    RADIO_FREQUENCY = 40,
-    FIRST_LO_FREQUENCY = 41,
-    SECOND_LO_FREQUENCY = 42,
-    SHIFT_FREQUENCY = 43,
-    LOW_EDGE = 48,
-    HIGH_EDGE = 49,
-    // 55-56
-    DEMOD_TYPE = 55,
-    OUTPUT_CHANNELS = 56,
-    // 80
-    PRESET = 80,
-    // 96
-    RTP_PT = 96,
+    OUTPUT_DATA_SOURCE_SOCKET = 16,
+    OUTPUT_DATA_DEST_SOCKET = 17,
+    OUTPUT_SSRC = 18,
+    OUTPUT_SAMPRATE = 20,
+    RADIO_FREQUENCY = 33,
+    FIRST_LO_FREQUENCY = 34,
+    SECOND_LO_FREQUENCY = 35,
+    SHIFT_FREQUENCY = 36,
+    LOW_EDGE = 39,
+    HIGH_EDGE = 40,
+    DEMOD_TYPE = 48,
+    OUTPUT_CHANNELS = 49,
+    PRESET = 85,
+    RTP_PT = 105,
+    OUTPUT_ENCODING = 107,
+}
+
+/// Valori dell'enum `encoding` di ka9q-radio (`src/rtp.h`).
+/// Usato come Int nei TLV `OUTPUT_ENCODING`.
+#[allow(dead_code)]
+#[repr(u64)]
+pub enum Encoding {
+    NoEncoding = 0,
+    S16le = 1,
+    S16be = 2,
+    Opus = 3,
+    /// Float32 little-endian — formato richiesto da TCI per i frame IQ.
+    F32le = 4,
 }
 
 impl TryFrom<u8> for StatusType {
@@ -72,18 +86,21 @@ impl TryFrom<u8> for StatusType {
             0 => Ok(Self::EOL),
             1 => Ok(Self::COMMAND_TAG),
             10 => Ok(Self::INPUT_SAMPRATE),
-            21 => Ok(Self::OUTPUT_SSRC),
-            23 => Ok(Self::OUTPUT_SAMPRATE),
-            40 => Ok(Self::RADIO_FREQUENCY),
-            41 => Ok(Self::FIRST_LO_FREQUENCY),
-            42 => Ok(Self::SECOND_LO_FREQUENCY),
-            43 => Ok(Self::SHIFT_FREQUENCY),
-            48 => Ok(Self::LOW_EDGE),
-            49 => Ok(Self::HIGH_EDGE),
-            55 => Ok(Self::DEMOD_TYPE),
-            56 => Ok(Self::OUTPUT_CHANNELS),
-            80 => Ok(Self::PRESET),
-            96 => Ok(Self::RTP_PT),
+            16 => Ok(Self::OUTPUT_DATA_SOURCE_SOCKET),
+            17 => Ok(Self::OUTPUT_DATA_DEST_SOCKET),
+            18 => Ok(Self::OUTPUT_SSRC),
+            20 => Ok(Self::OUTPUT_SAMPRATE),
+            33 => Ok(Self::RADIO_FREQUENCY),
+            34 => Ok(Self::FIRST_LO_FREQUENCY),
+            35 => Ok(Self::SECOND_LO_FREQUENCY),
+            36 => Ok(Self::SHIFT_FREQUENCY),
+            39 => Ok(Self::LOW_EDGE),
+            40 => Ok(Self::HIGH_EDGE),
+            48 => Ok(Self::DEMOD_TYPE),
+            49 => Ok(Self::OUTPUT_CHANNELS),
+            85 => Ok(Self::PRESET),
+            105 => Ok(Self::RTP_PT),
+            107 => Ok(Self::OUTPUT_ENCODING),
             _ => Err(TlvError::UnknownStatusType(v)),
         }
     }
@@ -194,7 +211,9 @@ pub fn decode_packet(data: &[u8]) -> Result<(PktType, Vec<TlvField>), TlvError> 
                     TlvValue::Double(f64::from_bits(decode_int(val_bytes)))
                 }
             }
-            Ok(StatusType::PRESET) => TlvValue::Bytes(val_bytes.to_vec()),
+            Ok(StatusType::PRESET
+            | StatusType::OUTPUT_DATA_SOURCE_SOCKET
+            | StatusType::OUTPUT_DATA_DEST_SOCKET) => TlvValue::Bytes(val_bytes.to_vec()),
             _ => TlvValue::Int(decode_int(val_bytes)),
         };
 
