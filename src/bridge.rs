@@ -225,6 +225,9 @@ pub struct BridgeConfig {
     pub poll_interval: Duration,
     pub default_samprate: u32,
     pub max_trx: u8,
+    /// Nome preset ka9q-radio per i canali creati (es. "iq", "iq48", "iq96").
+    /// Deve esistere in /usr/local/share/ka9q-radio/presets.conf.
+    pub preset: String,
 }
 
 /// Avvia il bridge: connette il control plane, lancia POLL periodico,
@@ -299,11 +302,18 @@ pub async fn run(
     let cmd_client = Arc::clone(&control);
     let table_for_cmd = Arc::clone(&ssrc_table);
     let state_for_cmd = Arc::clone(&state);
+    let preset_for_cmd: Arc<str> = Arc::from(cfg.preset.as_str());
     let cmd_task = tokio::spawn(async move {
         let mut rx = cmd_rx;
         while let Some(cmd) = rx.recv().await {
-            if let Err(e) =
-                dispatch_cmd(&cmd_client, &table_for_cmd, &state_for_cmd, cmd).await
+            if let Err(e) = dispatch_cmd(
+                &cmd_client,
+                &table_for_cmd,
+                &state_for_cmd,
+                &preset_for_cmd,
+                cmd,
+            )
+            .await
             {
                 warn!(err = %e, "cmd dispatch failed");
             }
@@ -353,6 +363,7 @@ async fn dispatch_cmd(
     control: &ControlClient,
     table: &Arc<Mutex<SsrcTable>>,
     state: &Arc<SharedState>,
+    preset: &str,
     cmd: BridgeCmd,
 ) -> anyhow::Result<()> {
     match cmd {
@@ -382,7 +393,10 @@ async fn dispatch_cmd(
             let mut fields = Vec::with_capacity(3);
             fields.push((StatusType::OUTPUT_SSRC, TlvValue::Int(ssrc as u64)));
             if needs_create {
-                fields.push((StatusType::PRESET, TlvValue::Bytes(b"iq".to_vec())));
+                fields.push((
+                    StatusType::PRESET,
+                    TlvValue::Bytes(preset.as_bytes().to_vec()),
+                ));
             }
             fields.push((
                 StatusType::RADIO_FREQUENCY,

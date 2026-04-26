@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         poll_interval: Duration::from_secs(cfg.poll_interval_secs),
         default_samprate: cfg.iq_samplerate,
         max_trx: cfg.max_trx,
+        preset: cfg.preset.clone(),
     };
 
     let bridge_fut = bridge::run(bridge_cfg, Arc::clone(&state), cmd_rx);

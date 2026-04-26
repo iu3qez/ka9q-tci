@@ -19,10 +19,18 @@ pub struct Args {
     pub mcast_iface: Option<IpAddr>,
 
     /// IQ sample rate offerto ai client TCI.
-    /// Default 12000 = sample rate del preset `iq` di ka9q-radio.
-    /// Cambiare richiede resampling lato bridge (non implementato).
-    #[arg(long, default_value_t = 12000)]
+    /// Deve coincidere con `samprate` del preset usato (vedi --preset),
+    /// altrimenti il client TCI riceve dati a velocità sbagliata.
+    /// Preset `iq48` → 48000, `iq96` → 96000, `iq` → 12000.
+    #[arg(long, default_value_t = 48000)]
     pub iq_samplerate: u32,
+
+    /// Preset ka9q-radio usato per i canali creati dal bridge.
+    /// Deve esistere in /usr/local/share/ka9q-radio/presets.conf con
+    /// `demod = linear` (IQ raw). Sample rate del preset deve combaciare
+    /// con --iq-samplerate.
+    #[arg(long, default_value = "iq48")]
+    pub preset: String,
 
     /// Numero massimo di receiver TCI esposti
     #[arg(long, default_value_t = 2)]
