@@ -187,6 +187,18 @@ impl SsrcTable {
         }
     }
 
+    /// Invalida lo stato di un canale dopo un cambio di preset (SetSr).
+    /// radiod può ricreare il canale e cambiare `data_group`; resettiamo
+    /// `created=false` e `data_group=None` per forzare:
+    ///   - re-invio di PRESET sul prossimo Tune
+    ///   - ri-discovery del data multicast nel rtp_manager_task
+    pub fn invalidate(&mut self, ssrc: u32) {
+        if let Some(ch) = self.by_ssrc.get_mut(&ssrc) {
+            ch.created = false;
+            ch.data_group = None;
+        }
+    }
+
     /// Iter immutabile su tutti i canali noti.
     pub fn iter(&self) -> impl Iterator<Item = &ChannelInfo> {
         self.by_ssrc.values()
@@ -225,9 +237,23 @@ pub struct BridgeConfig {
     pub poll_interval: Duration,
     pub default_samprate: u32,
     pub max_trx: u8,
-    /// Nome preset ka9q-radio per i canali creati (es. "iq", "iq48", "iq96").
-    /// Deve esistere in /usr/local/share/ka9q-radio/presets.conf.
-    pub preset: String,
+    /// Mapping (sample-rate Hz) → (nome preset ka9q-radio).
+    /// Il preset deve esistere in /usr/local/share/ka9q-radio/presets.conf
+    /// con `demod = linear` e `samprate` coincidente.
+    /// Default: 12000→iq, 48000→iq48, 96000→iq96.
+    pub preset_map: HashMap<u32, String>,
+    /// Preset usato se il samprate richiesto dal client TCI non è in
+    /// `preset_map` (warn + fallback).
+    pub default_preset: String,
+}
+
+/// Mapping di default samprate→preset.
+pub fn default_preset_map() -> HashMap<u32, String> {
+    let mut m = HashMap::new();
+    m.insert(12_000, "iq".to_string());
+    m.insert(48_000, "iq48".to_string());
+    m.insert(96_000, "iq96".to_string());
+    m
 }
 
 /// Avvia il bridge: connette il control plane, lancia POLL periodico,
@@ -299,10 +325,21 @@ pub async fn run(
     });
 
     // ── cmd_task: dispatch comandi TCI → COMMAND TLV ──
+    //
+    // Il task è un singolo consumer del canale mpsc, quindi ogni `BridgeCmd`
+    // viene processato sequenzialmente. Tune legge `state.iq_samplerate`
+    // tramite RwLock, scritto da server.rs su IqSamplerate; nel deployment
+    // single-client la sequenza IqSamplerate→…→Vfo arriva ordinata.
+    //
+    // Caso multi-client: due client che concorrono su Iq_SAMPLERATE/VFO
+    // possono interleave, e un Tune può vincere la corsa contro un SetSr
+    // da altro client → primo create con preset vecchio. Mitigato perché
+    // SetSr re-tune in seguito tutti i canali noti col nuovo preset.
     let cmd_client = Arc::clone(&control);
     let table_for_cmd = Arc::clone(&ssrc_table);
     let state_for_cmd = Arc::clone(&state);
-    let preset_for_cmd: Arc<str> = Arc::from(cfg.preset.as_str());
+    let preset_map: Arc<HashMap<u32, String>> = Arc::new(cfg.preset_map.clone());
+    let default_preset: Arc<str> = Arc::from(cfg.default_preset.as_str());
     let cmd_task = tokio::spawn(async move {
         let mut rx = cmd_rx;
         while let Some(cmd) = rx.recv().await {
@@ -310,7 +347,8 @@ pub async fn run(
                 &cmd_client,
                 &table_for_cmd,
                 &state_for_cmd,
-                &preset_for_cmd,
+                &preset_map,
+                &default_preset,
                 cmd,
             )
             .await
@@ -363,14 +401,26 @@ async fn dispatch_cmd(
     control: &ControlClient,
     table: &Arc<Mutex<SsrcTable>>,
     state: &Arc<SharedState>,
-    preset: &str,
+    preset_map: &HashMap<u32, String>,
+    default_preset: &str,
     cmd: BridgeCmd,
 ) -> anyhow::Result<()> {
     match cmd {
         BridgeCmd::Tune { trx, vfo, freq_hz } => {
-            // Sample rate corrente lato TCI (può essere stato modificato da
-            // IqSamplerate prima del primo Tune).
+            // Sample rate corrente richiesto dal client TCI.
+            // Determina il preset ka9q-radio da chiedere a radiod.
             let current_sr = *state.iq_samplerate.read().await;
+            let preset = preset_map
+                .get(&current_sr)
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| {
+                    warn!(
+                        samprate = current_sr,
+                        fallback = default_preset,
+                        "no preset mapped for samprate, using fallback"
+                    );
+                    default_preset
+                });
 
             // Decide se serve creazione o solo retune, dentro lock breve
             // (std::sync::Mutex, niente .await dentro lo scope).
@@ -383,13 +433,11 @@ async fn dispatch_cmd(
                 let needs_create = !ch.created;
                 (ch.ssrc, needs_create)
             };
-            let _ = current_sr; // riservato per futura logica di resampling
 
             // Al primo create mandiamo solo SSRC + PRESET + RADIO_FREQUENCY,
             // come fa il `tune` di ka9q-radio. Specificare OUTPUT_SAMPRATE o
-            // OUTPUT_ENCODING incompatibili col preset (es. preset iq ha
-            // samprate=12k, encoding s16be) fa rifiutare radiod silenziosamente.
-            // La conversione di formato avviene lato bridge sul data plane.
+            // OUTPUT_ENCODING incompatibili col preset fa rifiutare radiod
+            // silenziosamente. Il samprate è quindi quello del preset.
             let mut fields = Vec::with_capacity(3);
             fields.push((StatusType::OUTPUT_SSRC, TlvValue::Int(ssrc as u64)));
             if needs_create {
@@ -407,6 +455,8 @@ async fn dispatch_cmd(
                 ssrc = format!("{:#010x}", ssrc),
                 freq_hz,
                 create = needs_create,
+                preset = needs_create.then_some(preset),
+                samprate = current_sr,
                 "Tune → COMMAND"
             );
             control.send_command(&fields).await?;
@@ -422,27 +472,65 @@ async fn dispatch_cmd(
             }
         }
         BridgeCmd::SetSr { samprate } => {
-            // Snapshot degli SSRC noti (lock breve).
-            let ssrcs: Vec<u32> = {
-                let t = match table.lock() {
+            // Lookup preset corrispondente al nuovo samprate. Se non mappato,
+            // log warn e usa default. Risolto qui per logging coerente.
+            let preset = preset_map
+                .get(&samprate)
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| {
+                    warn!(
+                        samprate,
+                        fallback = default_preset,
+                        "no preset mapped for SetSr samprate, using fallback"
+                    );
+                    default_preset
+                });
+
+            // Snapshot dei canali esistenti per re-tune con il nuovo preset.
+            // Solo i canali GIÀ tunati (freq_hz != 0) vengono ri-accordati;
+            // canali con freq_hz=0 sono entry preallocate ma non ancora usate
+            // dal client e verranno tunate dal prossimo Tune con il nuovo SR.
+            //
+            // Cambio del preset implica: cambio samprate/passband, e — dato che
+            // radiod può scegliere un data_group diverso e rigenerare lo SSRC
+            // socket — invalidiamo `created` e `data_group` così che:
+            //   - il prossimo Tune ri-mandi PRESET (se serve)
+            //   - rtp_manager rifaccia la discovery del nuovo gruppo dallo STATUS.
+            let snapshot: Vec<(u32, u64)> = {
+                let mut t = match table.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                t.iter().map(|c| c.ssrc).collect()
+                let snap: Vec<(u32, u64)> = t
+                    .iter()
+                    .filter(|c| c.freq_hz != 0)
+                    .map(|c| (c.ssrc, c.freq_hz))
+                    .collect();
+                for (ssrc, _) in &snap {
+                    t.invalidate(*ssrc);
+                }
+                snap
             };
-            if ssrcs.is_empty() {
-                debug!(samprate, "SetSr: nessun SSRC noto, skip");
+            if snapshot.is_empty() {
+                debug!(samprate, preset, "SetSr: nessun canale tunato, skip");
                 return Ok(());
             }
-            for ssrc in ssrcs {
-                let fields = [
+            for (ssrc, freq_hz) in snapshot {
+                let fields = vec![
                     (StatusType::OUTPUT_SSRC, TlvValue::Int(ssrc as u64)),
                     (
-                        StatusType::OUTPUT_SAMPRATE,
-                        TlvValue::Int(samprate as u64),
+                        StatusType::PRESET,
+                        TlvValue::Bytes(preset.as_bytes().to_vec()),
+                    ),
+                    (
+                        StatusType::RADIO_FREQUENCY,
+                        TlvValue::Double(freq_hz as f64),
                     ),
                 ];
-                debug!(ssrc = format!("{:#010x}", ssrc), samprate, "SetSr → COMMAND");
+                debug!(
+                    ssrc = format!("{:#010x}", ssrc),
+                    samprate, preset, freq_hz, "SetSr → COMMAND"
+                );
                 control.send_command(&fields).await?;
             }
         }
