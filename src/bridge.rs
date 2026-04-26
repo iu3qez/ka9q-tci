@@ -496,9 +496,9 @@ async fn rtp_manager(
 /// Riceve RTP da un gruppo data, parsifica header, mappa SSRC → (trx, vfo)
 /// via SsrcTable, costruisce IqFrame e li pubblica su `state.iq_tx`.
 ///
-/// Assunzione: encoding del payload = F32LE stereo interleaved (forzato in
-/// fase di creazione canale tramite TLV OUTPUT_ENCODING). Se radiod emette
-/// in altro formato, i sample saranno garbage.
+/// Assunzione: encoding del payload = S16BE stereo interleaved (default di
+/// ka9q-radio per preset `iq`). Convertito a f32 nell'intervallo [-1.0, +1.0)
+/// prima di costruire il frame TCI binario, che vuole f32 little-endian.
 async fn rtp_ingest(
     group: Ipv4Addr,
     iface: Option<Ipv4Addr>,
@@ -544,7 +544,7 @@ async fn rtp_ingest(
         };
 
         let payload = &pkt[payload_off..];
-        let samples = decode_f32le_stereo(payload);
+        let samples = decode_s16be_stereo(payload);
         if samples.is_empty() {
             continue;
         }
@@ -559,26 +559,20 @@ async fn rtp_ingest(
     }
 }
 
-/// Decodifica payload F32LE stereo interleaved → Vec<(I, Q)>.
-/// Drop incompleto se il numero di byte non è multiplo di 8 (2 × f32).
-fn decode_f32le_stereo(payload: &[u8]) -> Vec<(f32, f32)> {
-    let n_pairs = payload.len() / 8;
+/// Decodifica payload S16BE stereo interleaved → Vec<(I, Q)> in float [-1, +1).
+/// Drop incompleto se il numero di byte non è multiplo di 4 (2 × i16).
+///
+/// Layout wire (per frame): [I_hi, I_lo, Q_hi, Q_lo, ...] big-endian i16.
+/// Normalizzazione: `f = i16_value / 32768.0`. Range: [-1.0, +1.0).
+fn decode_s16be_stereo(payload: &[u8]) -> Vec<(f32, f32)> {
+    const SCALE: f32 = 1.0 / 32768.0;
+    let n_pairs = payload.len() / 4;
     let mut out = Vec::with_capacity(n_pairs);
     for i in 0..n_pairs {
-        let off = i * 8;
-        let i_val = f32::from_le_bytes([
-            payload[off],
-            payload[off + 1],
-            payload[off + 2],
-            payload[off + 3],
-        ]);
-        let q_val = f32::from_le_bytes([
-            payload[off + 4],
-            payload[off + 5],
-            payload[off + 6],
-            payload[off + 7],
-        ]);
-        out.push((i_val, q_val));
+        let off = i * 4;
+        let i_raw = i16::from_be_bytes([payload[off], payload[off + 1]]);
+        let q_raw = i16::from_be_bytes([payload[off + 2], payload[off + 3]]);
+        out.push((i_raw as f32 * SCALE, q_raw as f32 * SCALE));
     }
     out
 }
@@ -674,21 +668,35 @@ mod tests {
         assert!(table.is_empty(), "table deve restare vuota per SSRC estranei");
     }
 
-    // ── Test: decode F32LE stereo ──
+    // ── Test: decode S16BE stereo ──
 
     #[test]
-    fn decode_f32le_stereo_basic() {
-        // Due coppie (I,Q) = 16 byte
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1.0_f32.to_le_bytes());
-        payload.extend_from_slice(&(-2.0_f32).to_le_bytes());
-        payload.extend_from_slice(&0.5_f32.to_le_bytes());
-        payload.extend_from_slice(&(-0.25_f32).to_le_bytes());
-
-        let samples = decode_f32le_stereo(&payload);
+    fn decode_s16be_stereo_basic() {
+        // Due coppie (I,Q) = 8 byte
+        // I=+1 (0x0001), Q=-1 (0xFFFF), I=+16384 (0x4000), Q=-16384 (0xC000)
+        let payload: Vec<u8> = vec![
+            0x00, 0x01, 0xFF, 0xFF,
+            0x40, 0x00, 0xC0, 0x00,
+        ];
+        let samples = decode_s16be_stereo(&payload);
         assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0], (1.0, -2.0));
-        assert_eq!(samples[1], (0.5, -0.25));
+        // 1/32768 ≈ 3.05e-5
+        assert!((samples[0].0 - (1.0 / 32768.0)).abs() < 1e-9);
+        assert!((samples[0].1 - (-1.0 / 32768.0)).abs() < 1e-9);
+        assert!((samples[1].0 - 0.5).abs() < 1e-9);
+        assert!((samples[1].1 - (-0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_s16be_stereo_full_scale() {
+        // i16::MIN → -1.0 (esatto), i16::MAX → +0.99997
+        let payload: Vec<u8> = vec![
+            0x80, 0x00, 0x7F, 0xFF, // I=-32768, Q=+32767
+        ];
+        let samples = decode_s16be_stereo(&payload);
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0].0 - (-1.0)).abs() < 1e-9);
+        assert!((samples[0].1 - (32767.0 / 32768.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -733,15 +741,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_f32le_stereo_drops_partial() {
-        // 12 byte = 1 coppia + 4 byte residui (drop)
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1.0_f32.to_le_bytes());
-        payload.extend_from_slice(&2.0_f32.to_le_bytes());
-        payload.extend_from_slice(&3.0_f32.to_le_bytes());
-        let samples = decode_f32le_stereo(&payload);
+    fn decode_s16be_stereo_drops_partial() {
+        // 6 byte = 1 coppia (4) + 2 byte residui (drop)
+        let payload: Vec<u8> = vec![
+            0x40, 0x00, 0xC0, 0x00, // I=+16384, Q=-16384 → ±0.5
+            0x12, 0x34,             // residuo, scartato
+        ];
+        let samples = decode_s16be_stereo(&payload);
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0], (1.0, 2.0));
+        assert!((samples[0].0 - 0.5).abs() < 1e-9);
+        assert!((samples[0].1 - (-0.5)).abs() < 1e-9);
     }
 
     // ── Test 6: nessun campo OUTPUT_SSRC → nessuna modifica alla table ──
