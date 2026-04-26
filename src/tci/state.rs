@@ -92,12 +92,20 @@ impl SharedState {
     }
 
     /// Genera le righe di stato corrente da inviare dopo l'handshake.
+    /// Include i `notification` standard (TX_ENABLE, TRX) richiesti da
+    /// alcuni client (es. SDC) per uscire dallo stato "wait start", e
+    /// chiude con `start;` per dichiarare che il device è running.
     pub async fn current_state_messages(&self) -> Vec<String> {
         use super::protocol::format_msg;
         let trx_vec = self.trx.read().await;
         let mut msgs = Vec::new();
         for (i, trx) in trx_vec.iter().enumerate() {
             let si = i.to_string();
+
+            // RX-only: dichiara TX disabilitato per ogni TRX.
+            msgs.push(format_msg("tx_enable", &[&si, "false"]));
+            msgs.push(format_msg("trx", &[&si, "false"]));
+
             msgs.push(format_msg("dds", &[&si, &trx.dds_freq_hz.to_string()]));
             for (vi, vfo) in trx.vfo.iter().enumerate() {
                 let sv = vi.to_string();
@@ -115,6 +123,8 @@ impl SharedState {
                 &[&si, &trx.filter_low.to_string(), &trx.filter_high.to_string()],
             ));
         }
+        // Annuncio finale: device running. SDC esce da "wait start" qui.
+        msgs.push(format_msg("start", &[]));
         msgs
     }
 }
