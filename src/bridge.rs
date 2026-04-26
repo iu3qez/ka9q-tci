@@ -133,7 +133,13 @@ impl SsrcTable {
         };
 
         let entry = self.by_ssrc.entry(ssrc).or_insert_with(|| ChannelInfo::new(trx, vfo));
-        entry.created = true;
+        // NB: `created` non viene toccato qui. Semantica: `created=true`
+        // significa "il bridge ha già inviato un COMMAND con PRESET per
+        // questo SSRC". Se radiod ha il canale aperto da un run precedente
+        // (stesso SSRC, preset diverso), non possiamo dedurlo dallo STATUS
+        // — anzi, vogliamo che il prossimo Tune ri-mandi PRESET per
+        // riportarlo al nostro preset corrente. mark_created() viene
+        // chiamato esplicitamente dal dispatch_cmd dopo il primo invio.
 
         for f in fields {
             match (f.tag, &f.value) {
@@ -746,7 +752,40 @@ mod tests {
         let ch = table.get(ssrc).expect("il canale deve esistere dopo update");
         assert_eq!(ch.freq_hz, 14_074_000, "freq_hz deve essere aggiornata");
         assert_eq!(ch.samprate, 0, "samprate deve restare 0 (non presente nei fields)");
-        assert!(ch.created, "created deve essere true");
+        assert!(
+            !ch.created,
+            "update_from_status NON deve toccare `created` — solo mark_created lo fa"
+        );
+    }
+
+    #[test]
+    fn update_from_status_does_not_imply_created() {
+        // Anche con tutti i field popolati, update_from_status non deve mai
+        // settare created=true. Solo mark_created() (chiamata esplicita dopo
+        // un nostro PRESET) ha quel diritto.
+        let mut table = SsrcTable::new();
+        let ssrc = ssrc_encode(0, 0);
+        let fields = vec![
+            TlvField {
+                tag: StatusType::OUTPUT_SSRC as u8,
+                value: TlvValue::Int(ssrc as u64),
+            },
+            TlvField {
+                tag: StatusType::RADIO_FREQUENCY as u8,
+                value: TlvValue::Double(14_074_000.0),
+            },
+            TlvField {
+                tag: StatusType::OUTPUT_SAMPRATE as u8,
+                value: TlvValue::Int(48_000),
+            },
+        ];
+        table.update_from_status(&fields);
+        let ch = table.get(ssrc).expect("canale presente");
+        assert!(!ch.created);
+        // mark_created esplicito → created passa a true
+        table.mark_created(ssrc);
+        let ch = table.get(ssrc).unwrap();
+        assert!(ch.created);
     }
 
     // ── Test 5: SSRC senza il nostro prefix viene ignorato ──
