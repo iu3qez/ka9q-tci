@@ -363,28 +363,26 @@ async fn dispatch_cmd(
 
             // Decide se serve creazione o solo retune, dentro lock breve
             // (std::sync::Mutex, niente .await dentro lo scope).
-            let (ssrc, needs_create, sr) = {
+            let (ssrc, needs_create) = {
                 let mut t = match table.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
                 let ch = t.get_or_insert(trx, vfo);
                 let needs_create = !ch.created;
-                let sr = if ch.samprate > 0 { ch.samprate } else { current_sr };
-                (ch.ssrc, needs_create, sr)
+                (ch.ssrc, needs_create)
             };
+            let _ = current_sr; // riservato per futura logica di resampling
 
-            let mut fields = Vec::with_capacity(5);
+            // Al primo create mandiamo solo SSRC + PRESET + RADIO_FREQUENCY,
+            // come fa il `tune` di ka9q-radio. Specificare OUTPUT_SAMPRATE o
+            // OUTPUT_ENCODING incompatibili col preset (es. preset iq ha
+            // samprate=12k, encoding s16be) fa rifiutare radiod silenziosamente.
+            // La conversione di formato avviene lato bridge sul data plane.
+            let mut fields = Vec::with_capacity(3);
             fields.push((StatusType::OUTPUT_SSRC, TlvValue::Int(ssrc as u64)));
             if needs_create {
                 fields.push((StatusType::PRESET, TlvValue::Bytes(b"iq".to_vec())));
-                fields.push((StatusType::OUTPUT_SAMPRATE, TlvValue::Int(sr as u64)));
-                // F32LE: il payload RTP arriva già nel formato che TCI vuole,
-                // niente conversione lato bridge.
-                fields.push((
-                    StatusType::OUTPUT_ENCODING,
-                    TlvValue::Int(Encoding::F32le as u64),
-                ));
             }
             fields.push((
                 StatusType::RADIO_FREQUENCY,
