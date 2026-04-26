@@ -85,7 +85,9 @@ async fn handle_client(
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     // ── Handshake ───────────────────────────────────────────────────
-    let iq_sr = *state.iq_samplerate.read().await;
+    // Nota: `iq_samplerate` NON va inviato durante l'handshake — è un comando
+    // Unidirectional client→server (TCI 2.0 §4.3). Il default lato server
+    // resta in `state.iq_samplerate` finché il client non lo cambia.
     let mod_refs: Vec<&str> = config.modulations.iter().map(|s| s.as_str()).collect();
     let init_msgs = handshake_messages(
         &config.device_name,
@@ -95,7 +97,6 @@ async fn handle_client(
         config.vfo_max_hz,
         config.if_min_hz,
         config.if_max_hz,
-        iq_sr,
         &mod_refs,
     );
 

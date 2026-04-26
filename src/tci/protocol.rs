@@ -315,6 +315,12 @@ pub fn format_msg(cmd: &str, args: &[&str]) -> String {
 
 /// Sequenza di handshake inviata al client appena connesso.
 ///
+/// Solo i comandi `Initialization` previsti dalla spec TCI 2.0 §4.1:
+/// PROTOCOL, DEVICE, RECEIVE_ONLY, TRX_COUNT, CHANNEL_COUNT, VFO_LIMITS,
+/// IF_LIMITS, MODULATIONS_LIST, READY. Tutto il resto (incluso
+/// `iq_samplerate`, che è Unidirectional client→server) è escluso —
+/// inviarli durante l'init fa rifiutare la connessione ai client strict.
+///
 /// Parametri configurabili dal bridge; i default riflettono un RX-only
 /// a banda larga (ka9q-radio RX888).
 pub fn handshake_messages(
@@ -325,24 +331,14 @@ pub fn handshake_messages(
     vfo_max_hz: u64,
     if_min_hz: i64,
     if_max_hz: i64,
-    iq_samplerate: u32,
     modulations: &[&str],
 ) -> Vec<String> {
     let mut msgs = Vec::new();
     msgs.push(format_msg("protocol", &["ExpertSDR3", "1.9"]));
     msgs.push(format_msg("device", &[device_name]));
-    msgs.push(format_msg(
-        "receive_only",
-        &["true"],
-    ));
-    msgs.push(format_msg(
-        "trx_count",
-        &[&trx_count.to_string()],
-    ));
-    msgs.push(format_msg(
-        "channels_count",
-        &[&channel_count.to_string()],
-    ));
+    msgs.push(format_msg("receive_only", &["true"]));
+    msgs.push(format_msg("trx_count", &[&trx_count.to_string()]));
+    msgs.push(format_msg("channels_count", &[&channel_count.to_string()]));
     msgs.push(format_msg(
         "vfo_limits",
         &[&vfo_min_hz.to_string(), &vfo_max_hz.to_string()],
@@ -351,15 +347,7 @@ pub fn handshake_messages(
         "if_limits",
         &[&if_min_hz.to_string(), &if_max_hz.to_string()],
     ));
-    msgs.push(format_msg(
-        "modulations_list",
-        modulations,
-    ));
-    msgs.push(format_msg(
-        "iq_samplerate",
-        &[&iq_samplerate.to_string()],
-    ));
-    // TODO: inviare stato corrente (frequenze VFO, modulazione, ecc.)
+    msgs.push(format_msg("modulations_list", modulations));
     msgs.push(format_msg("ready", &[]));
     msgs
 }
@@ -606,12 +594,16 @@ mod tests {
             30_000_000,
             -24_000,
             24_000,
-            48_000,
             &["AM", "LSB", "USB", "CW", "NFM"],
         );
         assert!(msgs.first().unwrap().starts_with("protocol:"));
         assert!(msgs.last().unwrap().starts_with("ready;"));
         assert!(msgs.iter().any(|m| m.starts_with("device:")));
         assert!(msgs.iter().any(|m| m.contains("receive_only:true")));
+        // iq_samplerate non deve apparire: è Unidirectional client→server
+        assert!(
+            !msgs.iter().any(|m| m.starts_with("iq_samplerate:")),
+            "iq_samplerate must not be in init handshake"
+        );
     }
 }
