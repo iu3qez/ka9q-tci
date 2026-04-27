@@ -1,0 +1,20 @@
+# Esempio di configurazione ka9q-tci.
+#
+# Uso:
+#   ka9q-tci --config config.yaml ...
+#
+# Solo i campi `trx` sono attualmente onorati. Tutti gli altri parametri
+# (status name, mcast iface, preset-map, ...) restano sui flag CLI.
+#
+# Il valore di freq imposta sia DDS che VFO A. freq_b è opzionale
+# (default = stesso di freq). modulation è opzionale (default "USB").
+
+trx:
+  # Primo RX
+  - freq: 7074000        # FT8 20m
+    modulation: USB
+
+  # Secondo RX
+  - freq: 14074000       # FT8 20m
+    modulation: USB
+    freq_b: 14076000     # frequenza VFO B distinta (opzionale)

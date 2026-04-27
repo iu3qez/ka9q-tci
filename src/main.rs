@@ -1,4 +1,5 @@
 mod config;
+mod config_file;
 mod radiod;
 mod tci;
 mod bridge;
@@ -63,8 +64,34 @@ async fn main() -> anyhow::Result<()> {
         "ka9q-tci starting"
     );
 
+    // Carica YAML opzionale con stato iniziale dei TRX.
+    let file_cfg = match cfg.config.as_deref() {
+        Some(p) => match config_file::FileConfig::load(p) {
+            Ok(Some(c)) => {
+                info!(path = %p.display(), trx_count = c.trx.len(), "config file loaded");
+                Some(c)
+            }
+            Ok(None) => {
+                warn!(path = %p.display(), "config path non esiste, uso defaults");
+                None
+            }
+            Err(e) => {
+                warn!(err = %e, "errore parsing config file, uso defaults");
+                None
+            }
+        },
+        None => None,
+    };
+    let initial_trx: &[config_file::TrxConfig] =
+        file_cfg.as_ref().map(|c| c.trx.as_slice()).unwrap_or(&[]);
+
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let state = SharedState::new(cfg.max_trx as usize, cfg.iq_samplerate, cmd_tx);
+    let state = SharedState::new_with_initial(
+        cfg.max_trx as usize,
+        cfg.iq_samplerate,
+        cmd_tx,
+        initial_trx,
+    );
 
     let server_config = ServerConfig {
         trx_count: cfg.max_trx,

@@ -81,8 +81,31 @@ impl SharedState {
         iq_samplerate: u32,
         cmd_tx: mpsc::Sender<BridgeCmd>,
     ) -> Arc<Self> {
+        Self::new_with_initial(trx_count, iq_samplerate, cmd_tx, &[])
+    }
+
+    /// Variante che accetta uno stato iniziale per i primi N TRX.
+    /// `initial[i]` configura il TRX `i`; gli indici oltre `initial.len()`
+    /// usano `TrxState::default()`.
+    pub fn new_with_initial(
+        trx_count: usize,
+        iq_samplerate: u32,
+        cmd_tx: mpsc::Sender<BridgeCmd>,
+        initial: &[crate::config_file::TrxConfig],
+    ) -> Arc<Self> {
         let (iq_tx, _) = broadcast::channel(64); // buffer 64 frame
-        let trx = (0..trx_count).map(|_| TrxState::default()).collect();
+        let trx = (0..trx_count)
+            .map(|i| {
+                let mut s = TrxState::default();
+                if let Some(cfg) = initial.get(i) {
+                    s.dds_freq_hz = cfg.freq;
+                    s.vfo[0].freq_hz = cfg.freq;
+                    s.vfo[1].freq_hz = cfg.freq_b.unwrap_or(cfg.freq);
+                    s.modulation = cfg.modulation.clone();
+                }
+                s
+            })
+            .collect();
         Arc::new(Self {
             trx: RwLock::new(trx),
             iq_samplerate: RwLock::new(iq_samplerate),

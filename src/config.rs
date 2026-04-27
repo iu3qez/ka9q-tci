@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 /// Bridge ka9q-radio IQ streams to a TCI WebSocket server.
 #[derive(Parser, Debug)]
@@ -44,4 +45,10 @@ pub struct Args {
     /// Intervallo POLL del control plane verso radiod (secondi)
     #[arg(long, default_value_t = 5)]
     pub poll_interval_secs: u64,
+
+    /// Path opzionale a un file YAML che imposta lo stato iniziale dei TRX
+    /// (frequenze VFO, modulazione). Se non specificato, vengono usati i
+    /// default hardcoded (FT8 20m USB).
+    #[arg(short = 'c', long)]
+    pub config: Option<PathBuf>,
 }
