@@ -639,22 +639,48 @@ async fn rtp_ingest(
             }
         };
 
-        // Mappa SSRC → (trx, vfo) e prendi samprate corrente
-        let (trx, samprate) = {
+        // Mappa SSRC → trx (lock breve).
+        let trx = {
             let t = match table.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             match t.get(hdr.ssrc) {
-                Some(ch) => (ch.trx as u32, ch.samprate.max(1)),
+                Some(ch) => ch.trx as u32,
                 None => continue, // SSRC non nostro o non ancora mappato
             }
         };
+
+        // Sample rate annunciato al client TCI: autoritativo, NON il
+        // valore della SsrcTable. Il preset attivo è scelto in funzione
+        // di `state.iq_samplerate` (vedi preset_map), quindi i due
+        // coincidono per costruzione. Mettere qui il valore della
+        // SsrcTable rischierebbe sample_rate=0 nel frame se lo STATUS
+        // non avesse ancora popolato OUTPUT_SAMPRATE.
+        let samprate = *state.iq_samplerate.read().await;
 
         let payload = &pkt[payload_off..];
         let samples = decode_s16be_stereo(payload);
         if samples.is_empty() {
             continue;
+        }
+
+        // Log diagnostico del PRIMO frame su questo gruppo: aiuta a
+        // verificare header TCI e contenuto IQ contro la spec ExpertSDR3.
+        static FIRST_FRAME_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !FIRST_FRAME_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let (i0, q0) = samples[0];
+            info!(
+                ssrc = format!("{:#010x}", hdr.ssrc),
+                trx,
+                samprate,
+                n_samples = samples.len(),
+                rtp_payload_len = payload.len(),
+                first_i = i0,
+                first_q = q0,
+                "first IQ frame to TCI clients"
+            );
         }
 
         let frame_bytes = build_iq_frame(trx, samprate, &samples);
