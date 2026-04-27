@@ -647,7 +647,21 @@ async fn rtp_ingest(
             };
             match t.get(hdr.ssrc) {
                 Some(ch) => ch.trx as u32,
-                None => continue, // SSRC non nostro o non ancora mappato
+                None => {
+                    // Log limitato (1× per SSRC sconosciuto) per diagnosticare
+                    // mismatch tra SSRC del pacchetto e quelli registrati.
+                    use std::sync::Mutex as StdMutex;
+                    static UNKNOWN_LOGGED: StdMutex<Option<u32>> = StdMutex::new(None);
+                    let mut g = UNKNOWN_LOGGED.lock().unwrap();
+                    if *g != Some(hdr.ssrc) {
+                        *g = Some(hdr.ssrc);
+                        tracing::warn!(
+                            ssrc = format!("{:#010x}", hdr.ssrc),
+                            "RTP packet with unknown SSRC, dropping"
+                        );
+                    }
+                    continue;
+                }
             }
         };
 
