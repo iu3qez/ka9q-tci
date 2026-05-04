@@ -129,6 +129,12 @@ impl SharedState {
             msgs.push(format_msg("tx_enable", &[&si, "false"]));
             msgs.push(format_msg("trx", &[&si, "false"]));
 
+            // `rx_enable` non è in spec TCI 2.0 ma è emesso da implementazioni
+            // di riferimento (es. madpsy/ka9q_ubersdr) ed è richiesto da SDC
+            // per attivare la subscription IQ — senza, il client riceve i
+            // frame binari ma non li renderizza.
+            msgs.push(format_msg("rx_enable", &[&si, "true"]));
+
             msgs.push(format_msg("dds", &[&si, &trx.dds_freq_hz.to_string()]));
             for (vi, vfo) in trx.vfo.iter().enumerate() {
                 let sv = vi.to_string();

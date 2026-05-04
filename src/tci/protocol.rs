@@ -338,7 +338,7 @@ pub fn handshake_messages(
     msgs.push(format_msg("device", &[device_name]));
     msgs.push(format_msg("receive_only", &["true"]));
     msgs.push(format_msg("trx_count", &[&trx_count.to_string()]));
-    msgs.push(format_msg("channels_count", &[&channel_count.to_string()]));
+    msgs.push(format_msg("channel_count", &[&channel_count.to_string()]));
     msgs.push(format_msg(
         "vfo_limits",
         &[&vfo_min_hz.to_string(), &vfo_max_hz.to_string()],
@@ -604,6 +604,16 @@ mod tests {
         assert!(
             !msgs.iter().any(|m| m.starts_with("iq_samplerate:")),
             "iq_samplerate must not be in init handshake"
+        );
+        // Spec §4.1 r.496: il nome è CHANNEL_COUNT singolare. Blocca il
+        // ritorno del typo `channels_count` (rotto contro client strict).
+        assert!(
+            msgs.iter().any(|m| m.starts_with("channel_count:")),
+            "channel_count missing or misspelled"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.starts_with("channels_count:")),
+            "channels_count (plural) is a spec violation"
         );
     }
 }
