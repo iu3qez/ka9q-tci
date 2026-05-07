@@ -23,7 +23,8 @@ qualsiasi macchina che possa raggiungere il gruppo multicast di `radiod`.
 - Parsing RTP e TLV ka9q: moduli nostri, niente dipendenze esterne (il
   protocollo di controllo di `radiod` è semplice e documentato).
 
-Non ci sono ancora `Cargo.toml` / sorgenti: greenfield.
+Bridge funzionante end-to-end con SDC + CW Skimmer (spot decodificati
+verificati contro Reverse Beacon Network).
 
 ## Network discovery
 
@@ -92,6 +93,34 @@ radiod (ka9q-radio) — RX888 MkII
 La creazione dinamica di canali sfrutta il fatto che `radiod` accetta un
 *nuovo* SSRC in un COMMAND packet e istanzia il canale al volo a partire
 dal preset indicato.
+
+## Trappole del control plane radiod
+
+**Packet shape obbligatorio.** Il packet COMMAND verso radiod deve
+replicare l'ordine e i campi del CLI `tune` di ka9q-radio
+(`../ka9q-radio/src/tune.c:265-312`):
+
+```
+COMMAND_TAG → OUTPUT_SSRC → LIFETIME → PRESET → RADIO_FREQUENCY → EOL
+```
+
+Senza `COMMAND_TAG` e `LIFETIME` radiod accetta la retune freq ma salta
+silenziosamente `loadpreset(...)`. Il canale ricade sul default
+dell'instance (es. `usb` 12k per `radiod@rx888-web.conf`) → il bridge
+legge audio mono USB-demodulato come fosse IQ stereo → spettro con
+segnali speculari, decodifica casuale. Il bug è invisibile dal lato
+bridge (nessun errore, ampiezze plausibili) e si scopre solo
+interrogando radiod con `tune -r web.local -s <decimal_ssrc>` (SSRC
+in **decimale**, non hex).
+
+**Filtro VFO B.** Quando un client TCI tuna VFO B (`vfo:trx,1,X;`), il
+bridge **non** crea un secondo canale ka9q-radio. Se lo facesse, due
+SSRC distinti (`vfo=0` e `vfo=1`) produrrebbero RTP in parallelo che
+finirebbero entrambi nel broadcast IQ del medesimo TRX TCI, generando
+artefatti AGC-like e segnali doppi. VFO B resta puramente client-side:
+lo stato si aggiorna ma nessun comando va a radiod. `rtp_ingest` filtra
+anche i frame di SSRC con `vfo!=0` per scartare canali residui che
+radiod può avere già attivi all'avvio del bridge.
 
 ## Convenzioni di lavoro
 
