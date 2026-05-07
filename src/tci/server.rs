@@ -226,11 +226,16 @@ async fn handle_command(
                     "vfo",
                     &[&trx.to_string(), &vfo.to_string(), &freq_hz.to_string()],
                 ));
-                send_bridge_cmd(state, BridgeCmd::Tune {
-                    trx: *trx as u8,
-                    vfo: *vfo as u8,
-                    freq_hz: *freq_hz,
-                });
+                // Solo VFO A genera un canale ka9q-radio. VFO B resta puramente
+                // client-side: SDC e altri client mantengono lo stato ma il bridge
+                // non crea un secondo SSRC che produrrebbe RTP duplicato (artefatti).
+                if vi == 0 {
+                    send_bridge_cmd(state, BridgeCmd::Tune {
+                        trx: *trx as u8,
+                        vfo: *vfo as u8,
+                        freq_hz: *freq_hz,
+                    });
+                }
             }
         }
 

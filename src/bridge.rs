@@ -440,12 +440,20 @@ async fn dispatch_cmd(
                 (ch.ssrc, needs_create)
             };
 
-            // Al primo create mandiamo solo SSRC + PRESET + RADIO_FREQUENCY,
-            // come fa il `tune` di ka9q-radio. Specificare OUTPUT_SAMPRATE o
-            // OUTPUT_ENCODING incompatibili col preset fa rifiutare radiod
-            // silenziosamente. Il samprate è quindi quello del preset.
-            let mut fields = Vec::with_capacity(3);
+            // Replichiamo l'ordine e i campi del CLI `tune` di ka9q-radio
+            // (src/tune.c:265-312): COMMAND_TAG, OUTPUT_SSRC, LIFETIME, PRESET
+            // (solo al create), RADIO_FREQUENCY. Senza COMMAND_TAG e LIFETIME,
+            // radiod ignora silenziosamente il PRESET e il canale ricade sul
+            // default config (es. usb 12k), mostrando audio mono al posto di
+            // IQ stereo → artefatti tipo "due segnali speculari" lato client.
+            // LIFETIME=0 = canale persistente (stesso default del CLI tune).
+            static CMD_TAG: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(1);
+            let tag = CMD_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut fields = Vec::with_capacity(5);
+            fields.push((StatusType::COMMAND_TAG, TlvValue::Int(tag as u64)));
             fields.push((StatusType::OUTPUT_SSRC, TlvValue::Int(ssrc as u64)));
+            fields.push((StatusType::LIFETIME, TlvValue::Int(0)));
             if needs_create {
                 fields.push((
                     StatusType::PRESET,
@@ -639,15 +647,19 @@ async fn rtp_ingest(
             }
         };
 
-        // Mappa SSRC → trx (lock breve).
+        // Mappa SSRC → trx (lock breve). Solo VFO A: i flussi VFO B
+        // arriverebbero come secondo SSRC del medesimo TRX e si
+        // sovrapporrebbero al broadcast IQ del client TCI, producendo
+        // segnali speculari/duplicati nello spettro.
         let trx = {
             let t = match table.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             match t.get(hdr.ssrc) {
-                Some(ch) => ch.trx as u32,
-                None => continue, // SSRC non nostro o non ancora mappato
+                Some(ch) if ch.vfo == 0 => ch.trx as u32,
+                Some(_) => continue, // VFO B (o altri) → ignora
+                None => continue,    // SSRC non nostro o non ancora mappato
             }
         };
 

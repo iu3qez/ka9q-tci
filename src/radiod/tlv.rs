@@ -64,6 +64,7 @@ pub enum StatusType {
     PRESET = 85,
     RTP_PT = 105,
     OUTPUT_ENCODING = 107,
+    LIFETIME = 117,
 }
 
 /// Valori dell'enum `encoding` di ka9q-radio (`src/rtp.h`).
