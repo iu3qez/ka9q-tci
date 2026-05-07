@@ -66,33 +66,57 @@ dipendenza esterna; è lì come riferimento per:
 
 ## Architettura
 
+Multi-endpoint: il binario espone N server TCI distinti (uno per banda
+HF), ognuno sulla propria porta WebSocket, tutti backed da un singolo
+`radiod`. Aggira il limite empirico `TRX_COUNT ≤ 2` per server di SDC
+e altri client passive. Configurazione via YAML (vedi
+`config.example.yaml` e `docs/multi-endpoint-plan.md`).
+
 ```
-TCI clients (WebSocket, ws://host:40001/)
-    │   text:   VFO:, DDS:, RX_ENABLE:, IQ_SAMPLERATE:, TRX:, ...
-    │   binary: header + IQ float32 LE interleaved
-    ▼
-ka9q-tci bridge (Rust, tokio)
-    │   - WS server + TCI state machine
-    │   - SSRC manager (mappa (rx,vfo) -> SSRC)
-    │   - RTP ingest per SSRC (multicast join)
-    │   - comandi TLV al control plane di radiod (UDP mcast :5006)
-    ▼
-radiod (ka9q-radio) — RX888 MkII
+SDC #1 ──ws://host:40001──┐                          ┌── canale 0x7C000000
+SDC #2 ──ws://host:40002──┤  ka9q-tci (1 binario,    ├── canale 0x7C010000
+SDC #3 ──ws://host:40003──┤  N task tokio)           ├── canale 0x7C020000
+   ...                     ├─→  - WS server per ep   │
+SDC #N ──ws://host:4000N──┘     - bridge condiviso ──┴─→ radiod (RX888)
+                                  - SsrcTable centrale     UDP mcast :5006
+                                  - rtp_ingest unico
 ```
+
+Forma legacy ancora supportata: senza `endpoints:` nel YAML, il bridge
+parte come singolo server sulla porta `--bind-addr` (drop-in per setup
+pre-multi-endpoint).
+
+### SSRC layout
+
+```
+[0x7C (8 bit)] [endpoint (8 bit)] [riserva (8 bit)] [trx (4 bit)] [vfo (4 bit)]
+```
+
+- prefix `0x7C` identifica i canali ka9q-tci (filtra residui di altri
+  client/run)
+- `endpoint` 0..255 = indice del TCI server endpoint nel YAML
+- `trx` 0..15, `vfo` 0..1 (VFO B filtrato lato bridge — vedi sotto)
+- bit 8..15 riservati per future estensioni
+
+Es.: endpoint=2 trx=0 vfo=0 → SSRC `0x7C020000`. Funzioni
+`ssrc_encode(ep, trx, vfo)` e `ssrc_decode(u32)` in `bridge.rs`.
 
 ### Mapping TCI ↔ ka9q-radio
 
 | TCI | ka9q-radio |
 |---|---|
-| RX index + VFO index | **SSRC** deterministico (es. `0xTCI0 \| rx<<4 \| vfo`) |
-| `VFO:<rx>,<vfo>,<hz>` | TLV `RADIO_FREQUENCY` sull'SSRC |
-| `IQ_SAMPLERATE:<sr>` | `samprate` del canale |
-| `RX_ENABLE:<rx>,true` | crea SSRC se non esiste (preset `iq`) |
-| `MODE:...` | in flusso IQ linear non cambia demod; accettato e logged |
+| Endpoint + RX index + VFO index | **SSRC** deterministico `0x7C \| ep<<16 \| trx<<4 \| vfo` |
+| `VFO:<rx>,<vfo>,<hz>` (VFO A) | TLV `RADIO_FREQUENCY` sull'SSRC |
+| `IQ_SAMPLERATE:<sr>` | `samprate` del canale (preset selezionato via `--preset-map`) |
+| `IQ_START:<rx>` | no-op (canale già esistente dal Tune iniziale) |
+| Init bridge | invia un Tune iniziale per ogni TRX configurato → radiod allineato prima del primo client |
 
 La creazione dinamica di canali sfrutta il fatto che `radiod` accetta un
 *nuovo* SSRC in un COMMAND packet e istanzia il canale al volo a partire
-dal preset indicato.
+dal preset indicato. Il bridge invia un Tune al startup per ogni TRX
+nel YAML, così radiod arriva in linea con le freq dichiarate prima
+ancora che un client si connetta — essenziale con consumer passive
+(SDC) che si fidano dello stato annunciato dal server.
 
 ## Trappole del control plane radiod
 
@@ -122,6 +146,15 @@ lo stato si aggiorna ma nessun comando va a radiod. `rtp_ingest` filtra
 anche i frame di SSRC con `vfo!=0` per scartare canali residui che
 radiod può avere già attivi all'avvio del bridge.
 
+**Single COMMAND_TAG.** `ControlClient::send_command`
+(`src/radiod/control.rs`) antepone già un `COMMAND_TAG` monotono come
+primo field del packet. I caller (`dispatch_cmd Tune/SetSr/...`) NON
+devono aggiungerne un altro: due `COMMAND_TAG` consecutivi fanno
+parsare radiod in modo errato e silenziosamente saltare il
+`loadpreset(...)` — stesso sintomo del packet shape rotto, ma con
+PRESET presente. Bug pescato 2026-05-07 col confronto contro `tune.c`
+(che emette un solo COMMAND_TAG).
+
 ## Convenzioni di lavoro
 
 - **Utente parla italiano** — rispondere in italiano.
@@ -134,13 +167,17 @@ radiod può avere già attivi all'avvio del bridge.
 ## Comandi
 
 - Build: `cargo build` (debug) / `cargo build --release`
-- Run: `cargo run -- --status-name hf.local --bind-addr 0.0.0.0:40001`
+- Run legacy single-endpoint: `cargo run -- --status-name hf.local --bind-addr 0.0.0.0:40001`
+- Run multi-endpoint: `cargo run -- --status-name hf.local --config /path/to/endpoints.yaml`
 - Test: `cargo test`
 - Lint: `RUSTFLAGS="-D warnings" cargo check` (CI-ready)
+- Diagnosi canale lato radiod: `tune -r <status_name> -s <decimal_ssrc>`
+  (SSRC in **decimale**, non hex; converti `0x7C010000` → `2080440320`)
 
 ## Riferimenti esterni
 
 - ka9q-radio: <https://github.com/ka9q/ka9q-radio>
-- Protocollo TCI: spec Expert Electronics (ExpertSDR2/3). Il formato dei
-  messaggi text (`CMD:params;`) e il frame binario IQ vanno documentati in
-  `docs/tci-wire.md` prima di scrivere il parser.
+- Protocollo TCI: spec Expert Electronics (ExpertSDR2/3) in
+  `docs/tci-protocol.txt`. Audit + cross-check contro
+  `madpsy/ka9q_ubersdr` documentati nei commit message.
+- Piano refactor multi-endpoint: `docs/multi-endpoint-plan.md`.
