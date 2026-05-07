@@ -315,11 +315,15 @@ pub fn format_msg(cmd: &str, args: &[&str]) -> String {
 
 /// Sequenza di handshake inviata al client appena connesso.
 ///
-/// Solo i comandi `Initialization` previsti dalla spec TCI 2.0 §4.1:
-/// PROTOCOL, DEVICE, RECEIVE_ONLY, TRX_COUNT, CHANNEL_COUNT, VFO_LIMITS,
-/// IF_LIMITS, MODULATIONS_LIST, READY. Tutto il resto (incluso
-/// `iq_samplerate`, che è Unidirectional client→server) è escluso —
-/// inviarli durante l'init fa rifiutare la connessione ai client strict.
+/// Comandi `Initialization` previsti dalla spec TCI 2.0 §4.1: PROTOCOL,
+/// DEVICE, RECEIVE_ONLY, TRX_COUNT, CHANNEL_COUNT, VFO_LIMITS, IF_LIMITS,
+/// MODULATIONS_LIST, READY. Più `IQ_SAMPLERATE` emesso *prima* di READY:
+/// la spec lo qualifica `Unidirectional` ma in pratica i client (es. SDC)
+/// hanno bisogno di sapere fin dall'init il rate IQ del server,
+/// altrimenti decodificano sul loro default client-side e si vede un
+/// mismatch (banda decodificata a metà / doppia velocità). Il
+/// reference impl di madpsy/ka9q_ubersdr lo emette qui per lo stesso
+/// motivo. Senza, SDC ignora quello che il server vuole.
 ///
 /// Parametri configurabili dal bridge; i default riflettono un RX-only
 /// a banda larga (ka9q-radio RX888).
@@ -332,6 +336,7 @@ pub fn handshake_messages(
     if_min_hz: i64,
     if_max_hz: i64,
     modulations: &[&str],
+    iq_samplerate: u32,
 ) -> Vec<String> {
     let mut msgs = Vec::new();
     msgs.push(format_msg("protocol", &["ExpertSDR3", "1.9"]));
@@ -348,6 +353,10 @@ pub fn handshake_messages(
         &[&if_min_hz.to_string(), &if_max_hz.to_string()],
     ));
     msgs.push(format_msg("modulations_list", modulations));
+    msgs.push(format_msg(
+        "iq_samplerate",
+        &[&iq_samplerate.to_string()],
+    ));
     msgs.push(format_msg("ready", &[]));
     msgs
 }
@@ -595,15 +604,24 @@ mod tests {
             -24_000,
             24_000,
             &["AM", "LSB", "USB", "CW", "NFM"],
+            96_000,
         );
         assert!(msgs.first().unwrap().starts_with("protocol:"));
         assert!(msgs.last().unwrap().starts_with("ready;"));
         assert!(msgs.iter().any(|m| m.starts_with("device:")));
         assert!(msgs.iter().any(|m| m.contains("receive_only:true")));
-        // iq_samplerate non deve apparire: è Unidirectional client→server
-        assert!(
-            !msgs.iter().any(|m| m.starts_with("iq_samplerate:")),
-            "iq_samplerate must not be in init handshake"
+        // iq_samplerate DEVE apparire prima di ready: i client (es. SDC)
+        // altrimenti decodificano sul loro default client-side e si vede un
+        // mismatch banda. Madpsy/ka9q_ubersdr lo emette qui per lo stesso
+        // motivo. Verifica empirica 2026-05-07.
+        let iq_pos = msgs.iter().position(|m| m.starts_with("iq_samplerate:"));
+        let ready_pos = msgs.iter().position(|m| m.starts_with("ready;"));
+        assert!(iq_pos.is_some(), "iq_samplerate must be in init handshake");
+        assert!(iq_pos < ready_pos, "iq_samplerate must come before ready");
+        assert_eq!(
+            msgs[iq_pos.unwrap()],
+            "iq_samplerate:96000;",
+            "iq_samplerate must reflect the value passed in"
         );
         // Spec §4.1 r.496: il nome è CHANNEL_COUNT singolare. Blocca il
         // ritorno del typo `channels_count` (rotto contro client strict).

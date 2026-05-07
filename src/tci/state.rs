@@ -51,9 +51,37 @@ impl Default for TrxState {
     }
 }
 
+/// Numero di sample complessi per RTP packet osservato da ka9q-radio
+/// in HF su MTU ethernet standard (1500). Usato solo per dimensionare il
+/// buffer del broadcast channel — non influenza il wire format.
+const ASSUMED_SAMPLES_PER_FRAME: u32 = 360;
+
+/// Secondi di IQ che il broadcast channel deve poter bufferizzare prima
+/// di iniziare a droppare con `Lagged(N)`. Coperto pause tipiche di SDC
+/// (spot-batch verso RBN, GC) osservate empiricamente in ~0.6s. 2s
+/// lascia ampio margine senza esplodere la memoria a rate alti.
+const BUF_TARGET_SECONDS: u32 = 2;
+
+/// Capacità del broadcast channel `iq_tx` in funzione del sample rate.
+/// Dimensionato per garantire `BUF_TARGET_SECONDS` di tolleranza al
+/// laggy consumer indipendentemente da `iq_samplerate`. A 48 kHz ≈ 266
+/// frame; a 384 kHz ≈ 2133 frame. Il bound inferiore evita buffer
+/// minuscoli per rate inattesi; il bound superiore evita esplosione
+/// memoria se il rate è patologico.
+pub(crate) fn iq_buffer_size(iq_samplerate: u32) -> usize {
+    const MIN: usize = 128;
+    const MAX: usize = 8192;
+    let frames_per_sec = iq_samplerate / ASSUMED_SAMPLES_PER_FRAME;
+    let target = (frames_per_sec as usize).saturating_mul(BUF_TARGET_SECONDS as usize);
+    target.clamp(MIN, MAX)
+}
+
 /// Frame IQ pronto per l'invio ai client (già serializzato come bytes TCI).
+/// Il bridge popola `endpoint` decodificandolo dall'SSRC; il server TCI
+/// inoltra al client solo i frame del proprio `endpoint_id`.
 #[derive(Debug, Clone)]
 pub struct IqFrame {
+    pub endpoint: u8,
     pub trx: u32,
     pub data: Vec<u8>, // header 64B + payload float32 LE
 }
@@ -93,7 +121,7 @@ impl SharedState {
         cmd_tx: mpsc::Sender<BridgeCmd>,
         initial: &[crate::config_file::TrxConfig],
     ) -> Arc<Self> {
-        let (iq_tx, _) = broadcast::channel(64); // buffer 64 frame
+        let (iq_tx, _) = broadcast::channel(iq_buffer_size(iq_samplerate));
         let trx = (0..trx_count)
             .map(|i| {
                 let mut s = TrxState::default();
@@ -155,5 +183,33 @@ impl SharedState {
         // Annuncio finale: device running. SDC esce da "wait start" qui.
         msgs.push(format_msg("start", &[]));
         msgs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iq_buffer_size_scales_with_rate() {
+        // A 48 kHz: 48000/360 * 2 ≈ 266 frame.
+        assert!(iq_buffer_size(48_000) >= 200 && iq_buffer_size(48_000) <= 400);
+        // A 96 kHz: ~533 frame.
+        assert!(iq_buffer_size(96_000) >= 400 && iq_buffer_size(96_000) <= 700);
+        // A 384 kHz: ~2133 frame.
+        assert!(iq_buffer_size(384_000) >= 1800 && iq_buffer_size(384_000) <= 2400);
+        // Monotonia: più alto il rate, più grande il buffer.
+        assert!(iq_buffer_size(48_000) < iq_buffer_size(96_000));
+        assert!(iq_buffer_size(96_000) < iq_buffer_size(192_000));
+        assert!(iq_buffer_size(192_000) < iq_buffer_size(384_000));
+    }
+
+    #[test]
+    fn iq_buffer_size_clamps_extremes() {
+        // Rate inattesi (0, 1Hz) cadono sul minimo.
+        assert_eq!(iq_buffer_size(0), 128);
+        assert_eq!(iq_buffer_size(1), 128);
+        // Rate patologico molto alto cade sul massimo.
+        assert_eq!(iq_buffer_size(u32::MAX), 8192);
     }
 }

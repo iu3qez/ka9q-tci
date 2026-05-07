@@ -23,38 +23,48 @@ use crate::radiod::tlv::{Encoding, StatusType, TlvField, TlvValue};
 use crate::tci::protocol::build_iq_frame;
 use crate::tci::state::{IqFrame, SharedState};
 
-/// Prefisso dello SSRC: identifica i canali creati da ka9q-tci.
-/// Usiamo un valore "TCI" stilizzato in nibble.
-pub const SSRC_PREFIX: u32 = 0x7C10_0000;
+/// Marker (8 bit alti) che identifica gli SSRC creati da ka9q-tci.
+pub const SSRC_PREFIX: u32 = 0x7C00_0000;
+pub const SSRC_PREFIX_MASK: u32 = 0xFF00_0000;
+pub const SSRC_ENDPOINT_SHIFT: u32 = 16;
+pub const SSRC_ENDPOINT_MASK: u32 = 0xFF;
 pub const SSRC_TRX_SHIFT: u32 = 4;
-pub const SSRC_VFO_MASK: u32 = 0x0F;
 pub const SSRC_TRX_MASK: u32 = 0x0F;
+pub const SSRC_VFO_MASK: u32 = 0x0F;
 
-/// Codifica deterministica (trx, vfo) → SSRC.
+/// Codifica deterministica (endpoint, trx, vfo) → SSRC.
 ///
-/// Layout (32 bit, big-endian dentro RTP):
-///   [SSRC_PREFIX (24 bit)] [trx (4 bit)] [vfo (4 bit)]
+/// Layout (32 bit, big-endian sul wire RTP):
+///   [0x7C (8 bit)] [endpoint (8 bit)] [riserva (8 bit)] [trx (4 bit)] [vfo (4 bit)]
 ///
-/// `trx` accettato 0..=15 (4 bit), `vfo` accettato 0..=15 (4 bit).
-/// Valori più grandi vengono troncati con `& 0xF`.
-pub fn ssrc_encode(trx: u8, vfo: u8) -> u32 {
-    SSRC_PREFIX | ((trx as u32 & SSRC_TRX_MASK) << SSRC_TRX_SHIFT) | (vfo as u32 & SSRC_VFO_MASK)
+/// `endpoint` accettato 0..=255, `trx` 0..=15, `vfo` 0..=15. Valori
+/// fuori range vengono troncati. Bit 8..15 sono attualmente sempre 0
+/// (`encode` li azzera, `decode` li ignora): riserva per future
+/// estensioni (es. sub-endpoint, channel-group, layer di virtualizzazione)
+/// senza rompere il decode esistente.
+pub fn ssrc_encode(endpoint: u8, trx: u8, vfo: u8) -> u32 {
+    SSRC_PREFIX
+        | ((endpoint as u32 & SSRC_ENDPOINT_MASK) << SSRC_ENDPOINT_SHIFT)
+        | ((trx as u32 & SSRC_TRX_MASK) << SSRC_TRX_SHIFT)
+        | (vfo as u32 & SSRC_VFO_MASK)
 }
 
-/// Decodifica SSRC → (trx, vfo). Restituisce None se non matcha il nostro prefix.
-pub fn ssrc_decode(ssrc: u32) -> Option<(u8, u8)> {
-    if (ssrc & 0xFFFF_FF00) != SSRC_PREFIX {
+/// Decodifica SSRC → (endpoint, trx, vfo). `None` se non matcha il prefix.
+pub fn ssrc_decode(ssrc: u32) -> Option<(u8, u8, u8)> {
+    if (ssrc & SSRC_PREFIX_MASK) != SSRC_PREFIX {
         return None;
     }
+    let endpoint = ((ssrc >> SSRC_ENDPOINT_SHIFT) & SSRC_ENDPOINT_MASK) as u8;
     let trx = ((ssrc >> SSRC_TRX_SHIFT) & SSRC_TRX_MASK) as u8;
     let vfo = (ssrc & SSRC_VFO_MASK) as u8;
-    Some((trx, vfo))
+    Some((endpoint, trx, vfo))
 }
 
 /// Stato di un canale ka9q-radio noto al bridge.
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     pub ssrc: u32,
+    pub endpoint: u8,
     pub trx: u8,
     pub vfo: u8,
     pub freq_hz: u64,
@@ -67,9 +77,10 @@ pub struct ChannelInfo {
 }
 
 impl ChannelInfo {
-    fn new(trx: u8, vfo: u8) -> Self {
+    fn new(endpoint: u8, trx: u8, vfo: u8) -> Self {
         Self {
-            ssrc: ssrc_encode(trx, vfo),
+            ssrc: ssrc_encode(endpoint, trx, vfo),
+            endpoint,
             trx,
             vfo,
             freq_hz: 0,
@@ -91,11 +102,13 @@ impl SsrcTable {
         Self::default()
     }
 
-    /// Inserisce (o restituisce) il ChannelInfo per (trx, vfo).
+    /// Inserisce (o restituisce) il ChannelInfo per (endpoint, trx, vfo).
     /// Se non esiste, viene creato con `created=false` e SSRC deterministico.
-    pub fn get_or_insert(&mut self, trx: u8, vfo: u8) -> &mut ChannelInfo {
-        let ssrc = ssrc_encode(trx, vfo);
-        self.by_ssrc.entry(ssrc).or_insert_with(|| ChannelInfo::new(trx, vfo))
+    pub fn get_or_insert(&mut self, endpoint: u8, trx: u8, vfo: u8) -> &mut ChannelInfo {
+        let ssrc = ssrc_encode(endpoint, trx, vfo);
+        self.by_ssrc
+            .entry(ssrc)
+            .or_insert_with(|| ChannelInfo::new(endpoint, trx, vfo))
     }
 
     /// Lookup per SSRC esatto.
@@ -127,12 +140,15 @@ impl SsrcTable {
             Some(s) => s,
             None => return,
         };
-        let (trx, vfo) = match ssrc_decode(ssrc) {
+        let (endpoint, trx, vfo) = match ssrc_decode(ssrc) {
             Some(x) => x,
             None => return, // non nostro
         };
 
-        let entry = self.by_ssrc.entry(ssrc).or_insert_with(|| ChannelInfo::new(trx, vfo));
+        let entry = self
+            .by_ssrc
+            .entry(ssrc)
+            .or_insert_with(|| ChannelInfo::new(endpoint, trx, vfo));
         // NB: `created` non viene toccato qui. Semantica: `created=true`
         // significa "il bridge ha già inviato un COMMAND con PRESET per
         // questo SSRC". Se radiod ha il canale aperto da un run precedente
@@ -224,16 +240,28 @@ impl SsrcTable {
 // ────────────────────────────────────────────────────────────────────
 
 /// Comandi inviati dai client TCI al bridge tramite `SharedState::cmd_tx`.
-/// Il bridge li traduce in COMMAND TLV verso radiod.
+/// Il bridge li traduce in COMMAND TLV verso radiod. `endpoint` identifica
+/// quale server TCI ha originato il comando (sempre 0 finché c'è un solo
+/// endpoint; entra in gioco con il refactor multi-endpoint).
 #[derive(Debug, Clone)]
 pub enum BridgeCmd {
-    /// Accorda il canale (trx, vfo) sulla frequenza data, creando il
-    /// canale ka9q se non esiste ancora.
-    Tune { trx: u8, vfo: u8, freq_hz: u64 },
-    /// Cambia il sample rate IQ per tutti i canali noti.
-    SetSr { samprate: u32 },
+    /// Accorda il canale (endpoint, trx, vfo) sulla frequenza data,
+    /// creando il canale ka9q se non esiste ancora.
+    Tune {
+        endpoint: u8,
+        trx: u8,
+        vfo: u8,
+        freq_hz: u64,
+    },
+    /// Cambia il sample rate IQ per tutti i canali dell'endpoint.
+    SetSr { endpoint: u8, samprate: u32 },
     /// Abilita/disabilita un canale (per ora: solo log; teardown TODO).
-    EnableRx { trx: u8, vfo: u8, enable: bool },
+    EnableRx {
+        endpoint: u8,
+        trx: u8,
+        vfo: u8,
+        enable: bool,
+    },
 }
 
 /// Configurazione runtime del bridge.
@@ -265,11 +293,20 @@ pub fn default_preset_map() -> HashMap<u32, String> {
 /// Avvia il bridge: connette il control plane, lancia POLL periodico,
 /// dispatch comandi TCI→radiod e aggiornamento dello stato SSRC.
 /// Ritorna solo su errore fatale.
+///
+/// `states` è indicizzato per `endpoint` (vedi `BridgeCmd::endpoint` e
+/// `IqFrame::endpoint`): il bridge invia frame IQ a `states[ep].iq_tx` e
+/// legge `iq_samplerate` da `states[ep]`. Per single-endpoint deploy
+/// `states.len() == 1`.
 pub async fn run(
     cfg: BridgeConfig,
-    state: Arc<SharedState>,
+    states: Vec<Arc<SharedState>>,
     cmd_rx: mpsc::Receiver<BridgeCmd>,
 ) -> anyhow::Result<()> {
+    if states.is_empty() {
+        anyhow::bail!("bridge::run requires at least one endpoint state");
+    }
+    let states: Arc<[Arc<SharedState>]> = Arc::from(states.into_boxed_slice());
     if cfg.poll_interval.is_zero() {
         anyhow::bail!("poll_interval must be > 0");
     }
@@ -343,7 +380,7 @@ pub async fn run(
     // SetSr re-tune in seguito tutti i canali noti col nuovo preset.
     let cmd_client = Arc::clone(&control);
     let table_for_cmd = Arc::clone(&ssrc_table);
-    let state_for_cmd = Arc::clone(&state);
+    let states_for_cmd = Arc::clone(&states);
     let preset_map: Arc<HashMap<u32, String>> = Arc::new(cfg.preset_map.clone());
     let default_preset: Arc<str> = Arc::from(cfg.default_preset.as_str());
     let cmd_task = tokio::spawn(async move {
@@ -352,7 +389,7 @@ pub async fn run(
             if let Err(e) = dispatch_cmd(
                 &cmd_client,
                 &table_for_cmd,
-                &state_for_cmd,
+                &states_for_cmd,
                 &preset_map,
                 &default_preset,
                 cmd,
@@ -367,10 +404,10 @@ pub async fn run(
 
     // ── rtp_manager_task: scopre data_group nuovi e spawna ingest ──
     let table_for_rtp = Arc::clone(&ssrc_table);
-    let state_for_rtp = Arc::clone(&state);
+    let states_for_rtp = Arc::clone(&states);
     let iface_for_rtp = cfg.iface;
     let rtp_task = tokio::spawn(async move {
-        rtp_manager(table_for_rtp, state_for_rtp, iface_for_rtp).await;
+        rtp_manager(table_for_rtp, states_for_rtp, iface_for_rtp).await;
     });
 
     // ── attesa del primo task che termina ──
@@ -406,14 +443,35 @@ pub async fn run(
 async fn dispatch_cmd(
     control: &ControlClient,
     table: &Arc<Mutex<SsrcTable>>,
-    state: &Arc<SharedState>,
+    states: &[Arc<SharedState>],
     preset_map: &HashMap<u32, String>,
     default_preset: &str,
     cmd: BridgeCmd,
 ) -> anyhow::Result<()> {
+    /// Restituisce lo state per `endpoint` o logga warn e segnala None
+    /// (caller deve uscire dal handler senza side effect).
+    fn endpoint_state<'a>(
+        states: &'a [Arc<SharedState>],
+        endpoint: u8,
+    ) -> Option<&'a Arc<SharedState>> {
+        let s = states.get(endpoint as usize);
+        if s.is_none() {
+            warn!(endpoint, n_endpoints = states.len(), "BridgeCmd con endpoint fuori range, ignoro");
+        }
+        s
+    }
     match cmd {
-        BridgeCmd::Tune { trx, vfo, freq_hz } => {
-            // Sample rate corrente richiesto dal client TCI.
+        BridgeCmd::Tune {
+            endpoint,
+            trx,
+            vfo,
+            freq_hz,
+        } => {
+            let state = match endpoint_state(states, endpoint) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            // Sample rate corrente richiesto dal client TCI dell'endpoint.
             // Determina il preset ka9q-radio da chiedere a radiod.
             let current_sr = *state.iq_samplerate.read().await;
             let preset = preset_map
@@ -435,7 +493,7 @@ async fn dispatch_cmd(
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                let ch = t.get_or_insert(trx, vfo);
+                let ch = t.get_or_insert(endpoint, trx, vfo);
                 let needs_create = !ch.created;
                 (ch.ssrc, needs_create)
             };
@@ -467,6 +525,9 @@ async fn dispatch_cmd(
 
             debug!(
                 ssrc = format!("{:#010x}", ssrc),
+                endpoint,
+                trx,
+                vfo,
                 freq_hz,
                 create = needs_create,
                 preset = needs_create.then_some(preset),
@@ -485,7 +546,15 @@ async fn dispatch_cmd(
                 t.mark_created(ssrc);
             }
         }
-        BridgeCmd::SetSr { samprate } => {
+        BridgeCmd::SetSr { endpoint, samprate } => {
+            // Sanity check: l'endpoint deve esistere. (Il filtro dei canali
+            // SsrcTable per `endpoint` rende il dispatch idempotente anche
+            // se lo state non c'è, ma logghiamo per non perdere comandi
+            // mal-routati.)
+            let _ = match endpoint_state(states, endpoint) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
             // Lookup preset corrispondente al nuovo samprate. Se non mappato,
             // log warn e usa default. Risolto qui per logging coerente.
             let preset = preset_map
@@ -501,9 +570,10 @@ async fn dispatch_cmd(
                 });
 
             // Snapshot dei canali esistenti per re-tune con il nuovo preset.
-            // Solo i canali GIÀ tunati (freq_hz != 0) vengono ri-accordati;
-            // canali con freq_hz=0 sono entry preallocate ma non ancora usate
-            // dal client e verranno tunate dal prossimo Tune con il nuovo SR.
+            // Solo i canali dell'endpoint richiesto, GIÀ tunati (freq_hz != 0)
+            // vengono ri-accordati. Filtro per endpoint: ogni server TCI ha il
+            // suo `iq_samplerate` indipendente, e cambiarlo non deve toccare i
+            // canali di altri endpoint che continuano col loro preset.
             //
             // Cambio del preset implica: cambio samprate/passband, e — dato che
             // radiod può scegliere un data_group diverso e rigenerare lo SSRC
@@ -517,7 +587,7 @@ async fn dispatch_cmd(
                 };
                 let snap: Vec<(u32, u64)> = t
                     .iter()
-                    .filter(|c| c.freq_hz != 0)
+                    .filter(|c| c.endpoint == endpoint && c.freq_hz != 0)
                     .map(|c| (c.ssrc, c.freq_hz))
                     .collect();
                 for (ssrc, _) in &snap {
@@ -548,10 +618,15 @@ async fn dispatch_cmd(
                 control.send_command(&fields).await?;
             }
         }
-        BridgeCmd::EnableRx { trx, vfo, enable } => {
+        BridgeCmd::EnableRx {
+            endpoint,
+            trx,
+            vfo,
+            enable,
+        } => {
             // MVP: solo log. Il teardown lato radiod richiede COMMAND specifico
             // ancora da definire (vedi ka9q-radio: rimozione canale via SSRC).
-            debug!(trx, vfo, enable, "EnableRx (no-op MVP)");
+            debug!(endpoint, trx, vfo, enable, "EnableRx (no-op MVP)");
         }
     }
     Ok(())
@@ -570,7 +645,7 @@ const RTP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// preset → un gruppo data).
 async fn rtp_manager(
     table: Arc<Mutex<SsrcTable>>,
-    state: Arc<SharedState>,
+    states: Arc<[Arc<SharedState>]>,
     iface: Option<Ipv4Addr>,
 ) {
     let mut joined: HashMap<Ipv4Addr, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -595,9 +670,9 @@ async fn rtp_manager(
         for group in new_groups {
             info!(group = %group, port = RTP_DATA_PORT, "joining RTP data group");
             let table_for_ingest = Arc::clone(&table);
-            let state_for_ingest = Arc::clone(&state);
+            let states_for_ingest = Arc::clone(&states);
             let handle = tokio::spawn(async move {
-                if let Err(e) = rtp_ingest(group, iface, table_for_ingest, state_for_ingest).await {
+                if let Err(e) = rtp_ingest(group, iface, table_for_ingest, states_for_ingest).await {
                     warn!(%group, err = %e, "rtp_ingest terminated");
                 }
             });
@@ -609,8 +684,10 @@ async fn rtp_manager(
     }
 }
 
-/// Riceve RTP da un gruppo data, parsifica header, mappa SSRC → (trx, vfo)
-/// via SsrcTable, costruisce IqFrame e li pubblica su `state.iq_tx`.
+/// Riceve RTP da un gruppo data, parsifica header, mappa SSRC → (endpoint,
+/// trx, vfo) via SsrcTable, costruisce IqFrame e lo pubblica su
+/// `states[endpoint].iq_tx`. SSRC il cui `endpoint` non ha uno state
+/// associato (out-of-range nella `states`) viene scartato.
 ///
 /// Assunzione: encoding del payload = S16BE stereo interleaved (default di
 /// ka9q-radio per preset `iq`). Convertito a f32 nell'intervallo [-1.0, +1.0)
@@ -619,7 +696,7 @@ async fn rtp_ingest(
     group: Ipv4Addr,
     iface: Option<Ipv4Addr>,
     table: Arc<Mutex<SsrcTable>>,
-    state: Arc<SharedState>,
+    states: Arc<[Arc<SharedState>]>,
 ) -> anyhow::Result<()> {
     let sock = join_multicast(group, RTP_DATA_PORT, iface).await?;
     // 8192 copre MTU ethernet standard (1500) e jumbo frame (9000) — solo
@@ -647,22 +724,32 @@ async fn rtp_ingest(
             }
         };
 
-        // Mappa SSRC → trx (lock breve). Solo VFO A: i flussi VFO B
-        // arriverebbero come secondo SSRC del medesimo TRX e si
+        // Mappa SSRC → (endpoint, trx) (lock breve). Solo VFO A: i flussi
+        // VFO B arriverebbero come secondo SSRC del medesimo TRX e si
         // sovrapporrebbero al broadcast IQ del client TCI, producendo
         // segnali speculari/duplicati nello spettro.
-        let trx = {
+        let (endpoint, trx) = {
             let t = match table.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             match t.get(hdr.ssrc) {
-                Some(ch) if ch.vfo == 0 => ch.trx as u32,
+                Some(ch) if ch.vfo == 0 => (ch.endpoint, ch.trx as u32),
                 Some(_) => continue, // VFO B (o altri) → ignora
                 None => continue,    // SSRC non nostro o non ancora mappato
             }
         };
 
+        // Routing al SharedState dell'endpoint giusto. Out-of-range
+        // significa che SsrcTable contiene un canale di un endpoint che
+        // questa run di bridge non gestisce — improbabile, log a debug.
+        let state = match states.get(endpoint as usize) {
+            Some(s) => s,
+            None => {
+                debug!(endpoint, n_endpoints = states.len(), "RTP frame con endpoint fuori range, scarto");
+                continue;
+            }
+        };
         // Sample rate annunciato al client TCI: autoritativo, NON il
         // valore della SsrcTable. Il preset attivo è scelto in funzione
         // di `state.iq_samplerate` (vedi preset_map), quindi i due
@@ -685,6 +772,7 @@ async fn rtp_ingest(
             let (i0, q0) = samples[0];
             info!(
                 ssrc = format!("{:#010x}", hdr.ssrc),
+                endpoint,
                 trx,
                 samprate,
                 n_samples = samples.len(),
@@ -697,6 +785,7 @@ async fn rtp_ingest(
 
         let frame_bytes = build_iq_frame(trx, samprate, &samples);
         let frame = IqFrame {
+            endpoint,
             trx,
             data: frame_bytes,
         };
@@ -727,32 +816,58 @@ fn decode_s16be_stereo(payload: &[u8]) -> Vec<(f32, f32)> {
 mod tests {
     use super::*;
 
-    // ── Test 1: roundtrip encode/decode per tutti i valori (trx, vfo) validi ──
+    // ── Test 1: roundtrip encode/decode su tutto lo spazio (endpoint, trx, vfo) ──
 
     #[test]
     fn encode_decode_roundtrip() {
-        for trx in 0u8..=15 {
-            for vfo in 0u8..=15 {
-                let ssrc = ssrc_encode(trx, vfo);
-                let decoded = ssrc_decode(ssrc);
-                assert_eq!(
-                    decoded,
-                    Some((trx, vfo)),
-                    "roundtrip fallito per trx={trx} vfo={vfo}: ssrc={ssrc:#010x}"
-                );
-            }
+        // Sample sparso ma non esaustivo dello spazio 256×16×16 = 65536:
+        // testa estremi, valori "tipici", combinazioni asimmetriche.
+        let cases: &[(u8, u8, u8)] = &[
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+            (0, 15, 15),   // boundary trx/vfo a endpoint=0 (singleton corrente)
+            (1, 0, 0),
+            (1, 1, 1),
+            (8, 0, 0),     // tipico endpoint per banda WARC (es. 12m)
+            (255, 0, 0),   // boundary endpoint
+            (255, 15, 15), // estremi tutti
+            (42, 7, 3),    // arbitrario
+        ];
+        for &(endpoint, trx, vfo) in cases {
+            let ssrc = ssrc_encode(endpoint, trx, vfo);
+            let decoded = ssrc_decode(ssrc);
+            assert_eq!(
+                decoded,
+                Some((endpoint, trx, vfo)),
+                "roundtrip fallito per ep={endpoint} trx={trx} vfo={vfo}: ssrc={ssrc:#010x}"
+            );
         }
+    }
+
+    #[test]
+    fn encode_distinct_per_endpoint() {
+        // SSRC distinti per endpoint diversi a parità di (trx, vfo).
+        let s0 = ssrc_encode(0, 0, 0);
+        let s1 = ssrc_encode(1, 0, 0);
+        let s8 = ssrc_encode(8, 0, 0);
+        assert_ne!(s0, s1);
+        assert_ne!(s0, s8);
+        assert_ne!(s1, s8);
     }
 
     // ── Test 2: SSRC con prefix diverso viene rifiutato ──
 
     #[test]
     fn decode_rejects_foreign_ssrc() {
+        // Prefix !=0x7C → reject.
         assert_eq!(ssrc_decode(0xDEAD_BEEF), None);
         assert_eq!(ssrc_decode(0x0000_0000), None);
         assert_eq!(ssrc_decode(0xFFFF_FFFF), None);
-        // SSRC_PREFIX + 1 byte sbagliato
-        assert_eq!(ssrc_decode(0x7C11_0000), None);
+        assert_eq!(ssrc_decode(0x7D00_0000), None);
+        // 0x7C00_0000 + endpoint=0x11 ora è valido (vecchio test obsoleto):
+        // questo è un endpoint legittimo nello schema multi-endpoint.
+        assert_eq!(ssrc_decode(0x7C11_0000), Some((0x11, 0, 0)));
     }
 
     // ── Test 3: get_or_insert è idempotente ──
@@ -760,10 +875,29 @@ mod tests {
     #[test]
     fn get_or_insert_idempotent() {
         let mut table = SsrcTable::new();
-        let ssrc_a = table.get_or_insert(3, 1).ssrc;
-        let ssrc_b = table.get_or_insert(3, 1).ssrc;
+        let ssrc_a = table.get_or_insert(0, 3, 1).ssrc;
+        let ssrc_b = table.get_or_insert(0, 3, 1).ssrc;
         assert_eq!(ssrc_a, ssrc_b, "SSRC deve essere lo stesso alla seconda chiamata");
         assert_eq!(table.len(), 1, "table deve avere un solo elemento");
+        // Stesso (trx, vfo) ma endpoint diverso → entry distinta.
+        let ssrc_c = table.get_or_insert(1, 3, 1).ssrc;
+        assert_ne!(ssrc_a, ssrc_c);
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn endpoint_propagates_through_table() {
+        // L'endpoint passato a get_or_insert deve essere recuperabile via
+        // get() con l'SSRC ottenuto: è il path che rtp_ingest usa per
+        // popolare IqFrame.endpoint a partire dall'SSRC RTP.
+        let mut table = SsrcTable::new();
+        let ssrc = table.get_or_insert(7, 1, 0).ssrc;
+        let ch = table.get(ssrc).expect("entry presente");
+        assert_eq!(ch.endpoint, 7);
+        assert_eq!(ch.trx, 1);
+        assert_eq!(ch.vfo, 0);
+        // Decode dell'SSRC restituisce gli stessi valori.
+        assert_eq!(ssrc_decode(ssrc), Some((7, 1, 0)));
     }
 
     // ── Test 4: update_from_status aggiorna freq, lascia samprate=0 ──
@@ -771,7 +905,7 @@ mod tests {
     #[test]
     fn update_from_status_partial() {
         let mut table = SsrcTable::new();
-        let ssrc = ssrc_encode(0, 0);
+        let ssrc = ssrc_encode(0, 0, 0);
 
         let fields = vec![
             TlvField {
@@ -802,7 +936,7 @@ mod tests {
         // settare created=true. Solo mark_created() (chiamata esplicita dopo
         // un nostro PRESET) ha quel diritto.
         let mut table = SsrcTable::new();
-        let ssrc = ssrc_encode(0, 0);
+        let ssrc = ssrc_encode(0, 0, 0);
         let fields = vec![
             TlvField {
                 tag: StatusType::OUTPUT_SSRC as u8,
@@ -881,7 +1015,7 @@ mod tests {
     #[test]
     fn update_from_status_extracts_data_group_ipv4() {
         let mut table = SsrcTable::new();
-        let ssrc = ssrc_encode(1, 0);
+        let ssrc = ssrc_encode(0, 1, 0);
         // sockaddr_in wire: [239, 22, 92, 109, 0x13, 0x88] → 239.22.92.109:5000
         let sockaddr_in = vec![239u8, 22, 92, 109, 0x13, 0x88];
         let fields = vec![
@@ -902,7 +1036,7 @@ mod tests {
     #[test]
     fn update_from_status_data_group_anomalous_length_ignored() {
         let mut table = SsrcTable::new();
-        let ssrc = ssrc_encode(0, 0);
+        let ssrc = ssrc_encode(0, 0, 0);
         let fields = vec![
             TlvField {
                 tag: StatusType::OUTPUT_SSRC as u8,

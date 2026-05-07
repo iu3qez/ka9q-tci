@@ -3,18 +3,45 @@
 # Uso:
 #   ka9q-tci --config config.yaml ...
 #
-# Solo i campi `trx` sono attualmente onorati. Tutti gli altri parametri
-# (status name, mcast iface, preset-map, ...) restano sui flag CLI.
+# Due formati supportati: multi-endpoint (preferito) e legacy single-list.
+# Il bridge sceglie automaticamente in base alla presenza di `endpoints`.
+
+# ── Forma multi-endpoint (preferita) ───────────────────────────────
+# N server TCI distinti, uno per banda HF. Aggira il limite empirico
+# TRX_COUNT ≤ 2 per server di alcuni client (es. SDC). Ogni endpoint:
+#   - port:           porta WebSocket (obbligatoria)
+#   - label:          nome banda, usato in logging (opzionale)
+#   - iq_samplerate:  rate iniziale annunciato ai client (opzionale,
+#                     fallback al default globale --iq-samplerate)
+#   - trx:            almeno 1 TRX, max 2 (limite SDC)
+
+endpoints:
+  - port: 40001
+    label: 40m
+    iq_samplerate: 48000
+    trx:
+      - { freq: 7074000, modulation: USB }      # FT8
+
+  - port: 40002
+    label: 20m
+    iq_samplerate: 48000
+    trx:
+      - { freq: 14074000, modulation: USB }     # FT8
+      - { freq: 14076000, modulation: USB }     # secondo TRX su 20m
+
+  - port: 40003
+    label: 80m
+    trx:
+      - { freq: 3573000, modulation: USB }      # FT8
+
+# ── Forma legacy (singolo endpoint) ────────────────────────────────
+# Compatibilità con i config pre-multi-endpoint. Se `endpoints` sopra è
+# definito, questa sezione viene ignorata. Per usare la forma legacy,
+# rimuovere/commentare il blocco `endpoints` e abilitare:
 #
-# Il valore di freq imposta sia DDS che VFO A. freq_b è opzionale
-# (default = stesso di freq). modulation è opzionale (default "USB").
-
-trx:
-  # Primo RX
-  - freq: 7074000        # FT8 20m
-    modulation: USB
-
-  # Secondo RX
-  - freq: 14074000       # FT8 20m
-    modulation: USB
-    freq_b: 14076000     # frequenza VFO B distinta (opzionale)
+# trx:
+#   - { freq: 7074000, modulation: USB }
+#   - { freq: 14074000, modulation: USB, freq_b: 14076000 }
+#
+# Nella forma legacy: porta da `--bind-addr`, samplerate da
+# `--iq-samplerate`, label = numero porta.

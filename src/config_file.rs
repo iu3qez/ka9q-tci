@@ -1,18 +1,35 @@
 //! Configurazione caricata da file YAML.
 //!
-//! Il file è opzionale. Se assente o se i campi mancano, valgono i default
-//! hardcoded del bridge (v. `TrxState::default`). Le opzioni CLI hanno
-//! comunque la precedenza sul file (vedi `main.rs`).
+//! Due formati supportati:
 //!
-//! Esempio minimo (`config.yaml`):
+//! 1. **Multi-endpoint (preferito)**: lista di server TCI separati, uno per
+//!    banda HF, ognuno sulla propria porta WebSocket. Aggira il limite
+//!    empirico `TRX_COUNT ≤ 2` per server di alcuni client (es. SDC).
 //!
-//! ```yaml
-//! trx:
-//!   - freq: 7074000      # primo RX, VFO A — FT8 20 m
-//!     modulation: USB
-//!   - freq: 14074000     # secondo RX, VFO A
-//!     modulation: USB
-//! ```
+//!    ```yaml
+//!    endpoints:
+//!      - port: 40001
+//!        label: 40m
+//!        iq_samplerate: 48000
+//!        trx:
+//!          - { freq: 7074000, modulation: USB }
+//!      - port: 40002
+//!        label: 20m
+//!        trx:
+//!          - { freq: 14074000, modulation: USB }
+//!    ```
+//!
+//! 2. **Legacy (singolo endpoint)**: solo lista TRX, retrocompat con i
+//!    config pre-multi-endpoint. Il bridge promuove la lista a un singolo
+//!    `EndpointConfig` usando i flag CLI (`--bind-addr`, `--iq-samplerate`).
+//!
+//!    ```yaml
+//!    trx:
+//!      - { freq: 7074000, modulation: USB }
+//!    ```
+//!
+//! Se entrambi i campi sono presenti, `endpoints` prevale e `trx` viene
+//! ignorato (con warn al caller). Le opzioni CLI restano override globali.
 
 use std::path::Path;
 
@@ -52,13 +69,46 @@ fn default_modulation() -> String {
     "USB".to_string()
 }
 
-/// Configurazione globale caricabile da YAML.
+/// Configurazione di un singolo endpoint TCI (porta WS + lista TRX).
+#[derive(Debug, Deserialize, Clone)]
+pub struct EndpointConfig {
+    /// Porta WebSocket dell'endpoint (es. 40001).
+    pub port: u16,
+    /// Etichetta umana, usata in logging e nel campo `device:` TCI.
+    /// Se assente, default al numero di porta.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// IQ sample rate iniziale annunciato ai client di questo endpoint.
+    /// Se assente, eredita il default globale (`--iq-samplerate`).
+    #[serde(default)]
+    pub iq_samplerate: Option<u32>,
+    /// TRX esposti dall'endpoint. Almeno uno richiesto.
+    pub trx: Vec<TrxConfig>,
+}
+
+/// Configurazione globale caricabile da YAML. Supporta due formati
+/// (multi-endpoint e legacy single-list); usa
+/// [`FileConfig::has_endpoints`] per scegliere il path di promozione
+/// nel caller.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct FileConfig {
-    /// Lista di TRX. Lunghezza ignorata se eccede `--max-trx`.
-    /// Se vuota o assente, usa i default hardcoded.
+    /// Forma legacy: lista TRX flat (singolo endpoint implicito).
+    /// Lunghezza ignorata se eccede `--max-trx`.
     #[serde(default)]
     pub trx: Vec<TrxConfig>,
+    /// Forma multi-endpoint: N server TCI distinti.
+    /// Se non vuota, ha precedenza su `trx`.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointConfig>,
+}
+
+impl FileConfig {
+    /// `true` se l'utente ha definito `endpoints:` (forma nuova).
+    /// Quando false, il caller deve promuovere `self.trx` a un singolo
+    /// `EndpointConfig` usando i default da CLI.
+    pub fn has_endpoints(&self) -> bool {
+        !self.endpoints.is_empty()
+    }
 }
 
 impl FileConfig {
@@ -124,5 +174,84 @@ trx:
         let path = Path::new("/tmp/__definitely_does_not_exist_ka9q.yaml");
         let r = FileConfig::load(path).unwrap();
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn parse_multi_endpoint_yaml() {
+        let yaml = r#"
+endpoints:
+  - port: 40001
+    label: 40m
+    iq_samplerate: 48000
+    trx:
+      - { freq: 7074000, modulation: USB }
+  - port: 40002
+    trx:
+      - { freq: 14074000 }
+"#;
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.has_endpoints());
+        assert_eq!(cfg.endpoints.len(), 2);
+        let ep0 = &cfg.endpoints[0];
+        assert_eq!(ep0.port, 40001);
+        assert_eq!(ep0.label.as_deref(), Some("40m"));
+        assert_eq!(ep0.iq_samplerate, Some(48000));
+        assert_eq!(ep0.trx.len(), 1);
+        assert_eq!(ep0.trx[0].freq, 7_074_000);
+        let ep1 = &cfg.endpoints[1];
+        assert_eq!(ep1.port, 40002);
+        assert!(ep1.label.is_none());
+        assert!(ep1.iq_samplerate.is_none());
+        assert_eq!(ep1.trx[0].modulation, "USB"); // default
+    }
+
+    #[test]
+    fn parse_legacy_yaml_no_endpoints() {
+        // Forma vecchia: solo `trx` flat. has_endpoints() = false → il
+        // caller dovrà promuovere a singolo endpoint.
+        let yaml = "trx:\n  - freq: 7074000\n";
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.has_endpoints());
+        assert_eq!(cfg.trx.len(), 1);
+        assert!(cfg.endpoints.is_empty());
+    }
+
+    #[test]
+    fn parse_both_present_endpoints_wins() {
+        // Se l'utente specifica entrambi (errore di config), `endpoints`
+        // prevale: has_endpoints() true e il caller userà quelli.
+        let yaml = r#"
+trx:
+  - freq: 7074000
+endpoints:
+  - port: 40001
+    trx:
+      - { freq: 14074000 }
+"#;
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.has_endpoints());
+        assert_eq!(cfg.endpoints.len(), 1);
+        // `trx` flat resta parsato ma il caller lo ignorerà.
+        assert_eq!(cfg.trx.len(), 1);
+    }
+
+    #[test]
+    fn parse_empty_endpoints_falls_back_to_legacy() {
+        // `endpoints: []` esplicito vuoto = stesso effetto di campo assente:
+        // has_endpoints() false, caller usa il path legacy.
+        let yaml = "endpoints: []\ntrx:\n  - freq: 7074000\n";
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.has_endpoints());
+        assert_eq!(cfg.trx.len(), 1);
+    }
+
+    #[test]
+    fn parse_endpoint_requires_port_and_trx() {
+        // Senza port, deserialize fallisce.
+        let yaml = "endpoints:\n  - label: foo\n    trx:\n      - { freq: 1 }\n";
+        assert!(serde_yaml::from_str::<FileConfig>(yaml).is_err());
+        // Senza trx, deserialize fallisce.
+        let yaml = "endpoints:\n  - port: 40001\n";
+        assert!(serde_yaml::from_str::<FileConfig>(yaml).is_err());
     }
 }

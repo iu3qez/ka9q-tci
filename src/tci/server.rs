@@ -18,6 +18,11 @@ use crate::bridge::BridgeCmd;
 
 /// Parametri del server TCI, derivati dalla config.
 pub struct ServerConfig {
+    /// Identifica l'endpoint nel multi-endpoint setup. I `BridgeCmd`
+    /// emessi portano questo id e gli `IqFrame` con `endpoint != id`
+    /// vengono filtrati prima di essere inoltrati ai client. Default 0
+    /// per single-endpoint deploy.
+    pub endpoint_id: u8,
     pub device_name: String,
     pub trx_count: u8,
     pub channel_count: u8,
@@ -31,6 +36,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            endpoint_id: 0,
             device_name: "ka9q-RX888".to_string(),
             trx_count: 2,
             channel_count: 2,
@@ -86,8 +92,10 @@ async fn handle_client(
 
     // ── Handshake ───────────────────────────────────────────────────
     // Nota: `iq_samplerate` NON va inviato durante l'handshake — è un comando
-    // Unidirectional client→server (TCI 2.0 §4.3). Il default lato server
-    // resta in `state.iq_samplerate` finché il client non lo cambia.
+    // `iq_samplerate` viene letto dallo state e propagato al client in init:
+    // SDC (e in genere i client passive) non lo chiede e si fida del valore
+    // annunciato. Senza, decodifica sul suo default e mismatch banda.
+    let iq_sr = *state.iq_samplerate.read().await;
     let mod_refs: Vec<&str> = config.modulations.iter().map(|s| s.as_str()).collect();
     let init_msgs = handshake_messages(
         &config.device_name,
@@ -98,6 +106,7 @@ async fn handle_client(
         config.if_min_hz,
         config.if_max_hz,
         &mod_refs,
+        iq_sr,
     );
 
     for msg in &init_msgs {
@@ -125,6 +134,12 @@ async fn handle_client(
             iq_result = iq_rx.recv() => {
                 match iq_result {
                     Ok(frame) => {
+                        // Multi-endpoint: ogni server consuma solo i frame
+                        // del proprio endpoint_id (gli altri sono per server
+                        // affratellati sulla stessa istanza ka9q-tci).
+                        if frame.endpoint != config.endpoint_id {
+                            continue;
+                        }
                         let trx = frame.trx as usize;
                         if trx < iq_active.len() && iq_active[trx] {
                             ws_tx.send(Message::Binary(frame.data.into())).await?;
@@ -231,6 +246,7 @@ async fn handle_command(
                 // non crea un secondo SSRC che produrrebbe RTP duplicato (artefatti).
                 if vi == 0 {
                     send_bridge_cmd(state, BridgeCmd::Tune {
+                        endpoint: config.endpoint_id,
                         trx: *trx as u8,
                         vfo: *vfo as u8,
                         freq_hz: *freq_hz,
@@ -338,6 +354,7 @@ async fn handle_command(
                     &[&trx.to_string(), &channel.to_string(), if *enable { "true" } else { "false" }],
                 ));
                 send_bridge_cmd(state, BridgeCmd::EnableRx {
+                    endpoint: config.endpoint_id,
                     trx: *trx as u8,
                     vfo: *channel as u8,
                     enable: *enable,
@@ -388,7 +405,10 @@ async fn handle_command(
         TciCommand::IqSamplerate { rate } => {
             *state.iq_samplerate.write().await = *rate;
             replies.push(format_msg("iq_samplerate", &[&rate.to_string()]));
-            send_bridge_cmd(state, BridgeCmd::SetSr { samprate: *rate });
+            send_bridge_cmd(state, BridgeCmd::SetSr {
+                endpoint: config.endpoint_id,
+                samprate: *rate,
+            });
         }
 
         TciCommand::IqStart { trx } => {
