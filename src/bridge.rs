@@ -505,11 +505,13 @@ async fn dispatch_cmd(
             // default config (es. usb 12k), mostrando audio mono al posto di
             // IQ stereo → artefatti tipo "due segnali speculari" lato client.
             // LIFETIME=0 = canale persistente (stesso default del CLI tune).
-            static CMD_TAG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(1);
-            let tag = CMD_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut fields = Vec::with_capacity(5);
-            fields.push((StatusType::COMMAND_TAG, TlvValue::Int(tag as u64)));
+            //
+            // NOTA: COMMAND_TAG viene aggiunto automaticamente da
+            // `ControlClient::send_command` come primo campo, NON va incluso
+            // qui. Aggiungerlo causerebbe due COMMAND_TAG nello stesso packet
+            // → radiod parsa storto e salta il `loadpreset(...)`, lasciando
+            // il canale sul default config dell'instance.
+            let mut fields = Vec::with_capacity(4);
             fields.push((StatusType::OUTPUT_SSRC, TlvValue::Int(ssrc as u64)));
             fields.push((StatusType::LIFETIME, TlvValue::Int(0)));
             if needs_create {
