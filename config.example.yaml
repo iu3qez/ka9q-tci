@@ -15,24 +15,70 @@
 #                     fallback al default globale --iq-samplerate)
 #   - trx:            almeno 1 TRX, max 2 (limite SDC)
 
+# Frequenze centrali = metà tra inizio banda IARU R1 e centro FT8.
+# Coprono CW sub-banda + FT8 + parte fonia digitale con un rate IQ
+# di 96 kHz (passband ±48 kHz attorno al centro).
+
 endpoints:
   - port: 40001
-    label: 40m
-    iq_samplerate: 48000
+    label: 160m
+    iq_samplerate: 96000
     trx:
-      - { freq: 7074000, modulation: USB }      # FT8
+      - { freq: 1825000, modulation: USB }      # (1810 + 1840) / 2
 
   - port: 40002
-    label: 20m
-    iq_samplerate: 48000
+    label: 80m
+    iq_samplerate: 96000
     trx:
-      - { freq: 14074000, modulation: USB }     # FT8
-      - { freq: 14076000, modulation: USB }     # secondo TRX su 20m
+      - { freq: 3536500, modulation: USB }      # (3500 + 3573) / 2
 
   - port: 40003
-    label: 80m
+    label: 60m
+    iq_samplerate: 96000
     trx:
-      - { freq: 3573000, modulation: USB }      # FT8
+      - { freq: 5354250, modulation: USB }      # (5351.5 + 5357) / 2 — R1 canalizzato
+
+  - port: 40004
+    label: 40m
+    iq_samplerate: 96000
+    trx:
+      - { freq: 7037000, modulation: USB }      # (7000 + 7074) / 2
+
+  - port: 40005
+    label: 30m
+    iq_samplerate: 48000
+    trx:
+      - { freq: 10118000, modulation: USB }     # (10100 + 10136) / 2 — WARC 50 kHz
+
+  - port: 40006
+    label: 20m
+    iq_samplerate: 96000
+    trx:
+      - { freq: 14037000, modulation: USB }     # (14000 + 14074) / 2
+
+  - port: 40007
+    label: 17m
+    iq_samplerate: 48000
+    trx:
+      - { freq: 18084000, modulation: USB }     # (18068 + 18100) / 2 — WARC 100 kHz
+
+  - port: 40008
+    label: 15m
+    iq_samplerate: 96000
+    trx:
+      - { freq: 21037000, modulation: USB }     # (21000 + 21074) / 2
+
+  - port: 40009
+    label: 12m
+    iq_samplerate: 48000
+    trx:
+      - { freq: 24902500, modulation: USB }     # (24890 + 24915) / 2 — WARC 100 kHz
+
+  - port: 40010
+    label: 10m
+    iq_samplerate: 96000
+    trx:
+      - { freq: 28037000, modulation: USB }     # (28000 + 28074) / 2
 
 # ── Forma legacy (singolo endpoint) ────────────────────────────────
 # Compatibilità con i config pre-multi-endpoint. Se `endpoints` sopra è
