@@ -129,10 +129,15 @@ def main():
         print("Re-run with sudo.", file=sys.stderr)
         sys.exit(1)
 
+    # Merge step. fftwf-wisdom 3.3.10 (Debian bookworm) fails with
+    # "error reading wisdom" when invoked with -w/-o but no problem
+    # specs on the command line. Passing the full problem list works:
+    # each spec is resolved from the imported wisdom (zero benchmark,
+    # instant) and re-exported to the output file.
     merge = ["fftwf-wisdom"]
     for part in parts:
         merge += ["-w", str(part)]
-    merge += ["-o", str(output)]
+    merge += ["-o", str(output), *problems]
     print(f"\n$ {' '.join(merge)}")
     try:
         subprocess.run(merge, check=True)
